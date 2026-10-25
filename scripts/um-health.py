@@ -33,6 +33,7 @@ HOME = pathlib.Path.home()
 DEFAULT_INSTALL = HOME / ".um-opencode"
 WATCHDOG_LOG = DEFAULT_INSTALL / "renew-watchdog.log"
 TASKS = (r"\UMGenAIProxy-Renew", r"\UMGenAIProxy-Models")
+UPSTREAM_BASE = "https://chat.genai.um.edu.mo"
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 
@@ -199,6 +200,36 @@ def check_token_file(checks: Checks, install_dir: pathlib.Path) -> None:
         checks.add(OK, "upstream-token file", f"valid for {minutes} min")
 
 
+def check_gateway(checks: Checks, install_dir: pathlib.Path) -> None:
+    """Ask the UM gateway directly whether the stored token is still accepted.
+
+    The JWT `exp` claim is only a local promise: on 2026-10-25 the stored token
+    still had four hours to run and the gateway answered 401 from one hour after
+    it was issued. Without this row the stack looks healthy until a request fails.
+    """
+    token = read_text(install_dir / "upstream-token")
+    if not token:
+        checks.add(FAIL, "gateway accepts token", "no token stored (run setup login)")
+        return
+    request = urllib.request.Request(f"{UPSTREAM_BASE}/api/models")
+    request.add_header("Authorization", f"Bearer {token}")
+    request.add_header("User-Agent", "UMOpenCodeProxy/1.2")
+    try:
+        with urllib.request.urlopen(request, timeout=15.0) as response:
+            checks.add(OK, "gateway accepts token", f"HTTP {response.status} from {UPSTREAM_BASE}")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            checks.add(
+                FAIL,
+                "gateway accepts token",
+                f"HTTP {exc.code} although the JWT has not expired - run 'python scripts/um-renew.py --force'",
+            )
+        else:
+            checks.add(WARN, "gateway accepts token", f"HTTP {exc.code} from {UPSTREAM_BASE}")
+    except (urllib.error.URLError, OSError) as exc:
+        checks.add(WARN, "gateway accepts token", f"not reachable ({getattr(exc, 'reason', exc)})")
+
+
 def check_watchdog(checks: Checks, log_path: pathlib.Path) -> None:
     text = read_text(log_path)
     if not text:
@@ -256,6 +287,7 @@ def main(argv: list[str] | None = None) -> int:
     check_models(checks, base_url, key_file)
     if not check_diagnostics(checks, base_url, key_file):
         check_token_file(checks, args.install_dir)
+    check_gateway(checks, args.install_dir)
     check_watchdog(checks, args.install_dir / "renew-watchdog.log")
     if not args.no_tasks:
         check_tasks(checks)

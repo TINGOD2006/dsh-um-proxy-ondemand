@@ -68,7 +68,7 @@ health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死�
 | `test/coldstart.mjs` | 冷啟動計時，供無視窗驗證使用。 |
 | `test/efficiency_unit.mjs` | 純單元測試（不寫檔、不起代理）：single-flight、輪詢排程、狀態檔節流、`healthDetail` 判定。 |
 | `scripts/um-recover.ps1` | 反代自救腳本：診斷 401（上游 UM token 過期 vs `local-api-key` 不對），可 `-Fix` 自動重新登入。 |
-| `scripts/um-renew.py` | 續期看門狗（獨立於代理）：token 到期前 20 分鐘自動跑 `login`，由排程工作 `\UMGenAIProxy-Renew` 每 5 分鐘叫一次。 |
+| `scripts/um-renew.py` | 續期看門狗（獨立於代理）：每 5 分鐘檢查 JWT `exp` **和 gateway 是否真的接受 token**，需要時自動跑 `login`、清掉殘留的登入 Chrome，並在續期後實測新 token。 |
 
 執行測試（前三支會實際啟停 8788 代理）：
 
@@ -180,10 +180,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix
 
 | 情況 | 行為 |
 | --- | --- |
-| token 還有效、距到期 > 20 分鐘 | 讀一次 JWT、靜默 `exit 0`（實測 **71 ms**，不開任何視窗） |
+| JWT 還有效、距到期 > 20 分鐘，**且 gateway 實測接受** | 讀一次 JWT ＋ 一次 `GET /api/models`，靜默 `exit 0`（實測 **315 ms**，不開任何視窗） |
 | 距到期 ≤ 20 分鐘、已過期、或 JWT 讀不到 | 執行 `python um_opencode_setup.py login --timeout 120`，把過程寫進 log |
+| **JWT 沒到期但 gateway 回 401／403** | 一樣當作需要續期（見下節：JWT `exp` 不是有效性證明） |
+| 續期後 gateway 仍拒絕新 token | 記成失敗（`token rejected by the gateway right after login`）並進入退避，不再假裝成功 |
+| 私有 profile 被殘留 Chrome 佔住、開不出 debug port | 自動 `taskkill` 那個殘留視窗再開新的（`closing stale Chrome holding the private profile: pid ...`） |
 | 續期失敗 | 15 分鐘內不重試（避免每 5 分鐘都開一次登入窗），之後再試 |
 | 同時有另一個在看門狗在跑 | 用 `renew-watchdog.lock` 互斥，直接跳過 |
+
+### JWT `exp` 不是有效性證明（2026-10-25 事故）
+
+2026-10-25 下午的「反代失效」不是 token 過期，而是**檔裡的 JWT 還宣稱有 4.7 小時，UM gateway 卻直接回 401**：
+當天 13:07 續期成功、13:07 的 JWT `exp` 是 22:07，但 14:08 起每個請求都是 401（token payload 帶
+`"mfa_verified":false`、`"session_stamp":null`）。舊版看門狗只看本地 `exp`，所以整個下午都沒有告警、沒有重試。
+
+現在看門狗與健康檢查都改成**兩個獨立判定**：
+
+- `/diagnostics` 的 `token.valid`、`um-renew.py --status`：只代表 JWT 還沒過期（樂觀）。
+- **真的拿 token 打 `https://chat.genai.um.edu.mo/api/models`**：gateway 說 200 才算數。
+  `um-renew.py --probe` 單獨跑這項；`um-health.py` 也新增一列 `gateway accepts token`。
+
+另外，殘留的登入 Chrome 會鎖住 `~\.um-opencode\browser-profile`：Chrome 對同一個 `--user-data-dir` 只允許一個實例，
+第二個行程只會把 URL 交棒給舊的然後退出，於是自動登入永遠等不到 debug port（log：`a Chrome window already owns
+the private login profile and exposes no debug port`／`auto-login skipped: no login window with a debug port is open`）。
+看門狗現在會在續期前自動清掉這種殘留視窗。
 
 檔案位置（都在 `C:\Users\TINGOD\.um-opencode\`）：`renew-watchdog.log`（每次判斷與結果）、
 `renew-watchdog.lock`、`renew-watchdog.last-fail`。
@@ -191,6 +211,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix
 ```powershell
 # 只看狀態，不動任何東西
 C:\Python314\python.exe -B scripts\um-renew.py --status
+
+# 問 gateway 這個 token 還算不算數（exit 0 接受 / 2 被拒 / 3 連不上）
+C:\Python314\python.exe -B scripts\um-renew.py --probe
 
 # 立刻續期一次（不必等排程）
 C:\Python314\python.exe -B scripts\um-renew.py --force
@@ -325,8 +348,12 @@ npm run um:health -- --no-tasks   # 跳過排程查詢（沒有 schtasks 權限�
 ```
 
 檢查項目：`/health`、帶 key 的 `/v1/models`、`/diagnostics`（代理自己的計數器與 log 統計）、
-上游 token 剩餘時間（`/diagnostics` 不可用時直接解 JWT `exp`）、`renew-watchdog.log` 最後一行、
-排程 `\UMGenAIProxy-Renew` 與 `\UMGenAIProxy-Models` 的狀態與下次執行時間。
+上游 token 剩餘時間（`/diagnostics` 不可用時直接解 JWT `exp`）、**`gateway accepts token`（直接拿 token 打
+`https://chat.genai.um.edu.mo/api/models`，401 就判 FAIL 並提示跑 `um-renew.py --force`）**、
+`renew-watchdog.log` 最後一行、排程 `\UMGenAIProxy-Renew` 與 `\UMGenAIProxy-Models` 的狀態與下次執行時間。
+
+> 為什麼要單獨一列：JWT 的 `exp` 只是本地宣稱。2026-10-25 就出現過「JWT 顯示還有 4.7 小時、gateway 已經 401」
+> 的情況，只看剩餘時間的健康檢查會給出綠色。詳細事故說明見上面「JWT `exp` 不是有效性證明」。
 
 ### `/diagnostics`：代理端可觀察性
 
