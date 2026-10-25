@@ -64,6 +64,12 @@ DEFAULT_PROFILE = HOME / ".dsh" / "profiles" / "desktop" / "cordis.patch.yml"
 DEFAULT_OPENCODE = HOME / ".um-opencode" / "opencode.json"
 DEFAULT_KEY = HOME / ".um-opencode" / "local-api-key"
 DEFAULT_LOG = HOME / ".um-opencode" / "um-models-sync.log"
+DEFAULT_TOKEN = HOME / ".um-opencode" / "upstream-token"
+UPSTREAM_BASE = "https://chat.genai.um.edu.mo"
+
+# Set to "gateway" when the catalog came straight from UM because the local
+# proxy was asleep; main() logs that, so a night-time run stays explainable.
+CATALOG_SOURCE = "proxy"
 REGISTRY = pathlib.Path(__file__).with_name("um-models.json")
 
 VERSION_SUFFIX = re.compile(r"(?<=[A-Za-z])[-_.]v?(\d{2,4})$")
@@ -101,6 +107,54 @@ def read_api_key(path: pathlib.Path) -> str:
     return key
 
 
+def read_upstream_token(path: pathlib.Path = DEFAULT_TOKEN) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def fetch_catalog_direct(timeout: float = 15.0) -> list[dict]:
+    """Ask the UM gateway itself, so a sleeping proxy does not skip the sync.
+
+    The proxy is on-demand: at night it is stopped and ``--auto`` used to log
+    "skipped: the proxy is not reachable", which silently disabled model sync
+    for those hours. The gateway publishes the same model objects (id, name,
+    max_model_len, capabilities), so the comparison can run without it.
+    """
+    global CATALOG_SOURCE
+    token = read_upstream_token()
+    if not token:
+        raise SyncError("the proxy is asleep and no upstream token is stored")
+    request = urllib.request.Request(
+        UPSTREAM_BASE + "/api/models",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "UMOpenCodeProxy/1.2",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise SyncError(
+            f"the UM gateway answered HTTP {exc.code} (run scripts/um-renew.py --force if the token was rejected)"
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise SyncError(f"neither the proxy nor the UM gateway is reachable: {exc}") from exc
+    items = payload.get("data") if isinstance(payload, dict) else payload
+    catalog = [
+        item
+        for item in (items or [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
+    ]
+    if not catalog:
+        raise SyncError("the UM gateway returned an empty model list")
+    CATALOG_SOURCE = "gateway"
+    return catalog
+
+
 def fetch_catalog(base_url: str, api_key: str, timeout: float = 15.0) -> list[dict]:
     """The full model objects the gateway publishes (id, name, max_model_len, capabilities)."""
     request = urllib.request.Request(
@@ -113,7 +167,12 @@ def fetch_catalog(base_url: str, api_key: str, timeout: float = 15.0) -> list[di
     except urllib.error.HTTPError as exc:
         raise SyncError(f"the proxy answered HTTP {exc.code} for /v1/models (is the api key right?)") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise SyncError(f"the proxy is not reachable at {base_url}: {exc}") from exc
+        try:
+            return fetch_catalog_direct(timeout)
+        except SyncError as fallback:
+            raise SyncError(
+                f"the proxy is not reachable at {base_url}: {exc}; {fallback}"
+            ) from exc
     items = payload.get("data") if isinstance(payload, dict) else payload
     catalog = [
         item
@@ -536,6 +595,9 @@ def main() -> int:
             return 0
         log(f"error: {exc}", log_file)
         return 2
+
+    if CATALOG_SOURCE != "proxy":
+        log("the proxy was asleep; compared against the UM gateway directly", log_file)
 
     warnings: list[str] = []
     entries = entries_for(catalog, registry, warnings)

@@ -6,8 +6,13 @@ Checks, in order:
   2. /v1/models         - the local API key works end to end
   3. /diagnostics      - proxy counters, token expiry, recent upstream trouble
   4. token file         - when /diagnostics is unavailable (old proxy build)
-  5. renew watchdog log - the last automatic token renewal
-  6. scheduled tasks    - \\UMGenAIProxy-Renew and \\UMGenAIProxy-Models exist
+  5. gateway            - the UM gateway still accepts the stored token
+  6. renew watchdog log - the last automatic token renewal
+  7. scheduled tasks    - \\UMGenAIProxy-Renew and \\UMGenAIProxy-Models exist
+
+The proxy/build row matters: an edited um_opencode_setup.py only takes effect
+after the proxy restarts, so a stale process can keep serving old code while
+every file on disk already looks fixed (that happened on 2026-10-25).
 
 Exit codes: 0 all good, 1 warnings (proxy asleep, token expiring, tasks unreadable),
 2 failures (proxy answers but the stack is broken, token expired, models 401).
@@ -21,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import pathlib
 import subprocess
@@ -120,7 +126,9 @@ def check_models(checks: Checks, base_url: str, key_file: pathlib.Path) -> None:
     checks.add(OK if names else WARN, "/v1/models", detail)
 
 
-def check_diagnostics(checks: Checks, base_url: str, key_file: pathlib.Path) -> bool:
+def check_diagnostics(
+    checks: Checks, base_url: str, key_file: pathlib.Path, install_dir: pathlib.Path | None = None
+) -> bool:
     key = read_text(key_file)
     if not key:
         return False
@@ -146,6 +154,25 @@ def check_diagnostics(checks: Checks, base_url: str, key_file: pathlib.Path) -> 
         f"requests {stats.get('requests', 0)}, upstreamFailures {stats.get('upstreamFailures', 0)}, "
         f"retries {stats.get('upstreamRetries', 0)}",
     )
+
+    running_build = proxy.get("build")
+    script = (install_dir or DEFAULT_INSTALL) / "um_opencode_setup.py"
+    try:
+        local_build = hashlib.sha256(script.read_bytes()).hexdigest()[:12]
+    except OSError:
+        local_build = None
+    if not running_build:
+        checks.add(WARN, "proxy build", "not reported by this proxy build - restart the proxy")
+    elif local_build and running_build != local_build:
+        checks.add(
+            FAIL,
+            "proxy build",
+            f"running {running_build} but {script.name} is {local_build} - restart the proxy",
+        )
+    elif local_build:
+        checks.add(OK, "proxy build", f"{running_build} matches {script.name}")
+    else:
+        checks.add(OK, "proxy build", str(running_build))
 
     token = payload.get("token") or {}
     seconds_left = token.get("secondsLeft")
@@ -179,6 +206,17 @@ def check_diagnostics(checks: Checks, base_url: str, key_file: pathlib.Path) -> 
         if log.get("lastError"):
             detail += f"; last: {log['lastError'][:120]}"
         checks.add(level, "proxy.log (24h)", detail)
+
+    starts = int((payload.get("log") or {}).get("starts") or 0)
+    if starts:
+        uptime = float(proxy.get("uptimeSeconds") or 0)
+        # A cold start per idle-stop/wake pair is normal for an on-demand proxy.
+        # Many starts plus a very young process is the actual crash-loop signal.
+        checks.add(
+            WARN if (starts >= 8 and uptime < 180) else OK,
+            "proxy restarts (24h)",
+            f"{starts} start(s), current uptime {int(uptime)}s",
+        )
     return True
 
 
@@ -285,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     checks = Checks()
     check_proxy(checks, base_url)
     check_models(checks, base_url, key_file)
-    if not check_diagnostics(checks, base_url, key_file):
+    if not check_diagnostics(checks, base_url, key_file, args.install_dir):
         check_token_file(checks, args.install_dir)
     check_gateway(checks, args.install_dir)
     check_watchdog(checks, args.install_dir / "renew-watchdog.log")

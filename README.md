@@ -406,3 +406,33 @@ curl.exe -s -H "Authorization: Bearer $key" "http://127.0.0.1:8788/diagnostics?p
    schtasks /Create /TN "\UMGenAIProxy" /XML `
      "C:\Users\TINGOD\Documents\deepseek-harness\default-workspace\cmd_popup_diagnosis\um-proxy-task-export.xml"
    ```
+
+## 穩定性硬化（2026-10-25 第三輪）
+
+2026-10-25 的事故：JWT 顯示還剩 4.7 小時，gateway 卻從發放後約一小時起一路 401；同時一個殘留的
+Chrome 佔住私有 profile 卻沒有 debug port，續期每次都 `auto-login skipped`。除了修掉那兩件事，
+這一輪把「同樣的坑不會再靜默發生」補起來：
+
+| 改動 | 解決什麼 |
+| --- | --- |
+| `\UMGenAIProxy-Renew`、`\UMGenAIProxy-Models` 都設 `StartWhenAvailable` | 機器休眠／關機期間錯過的排程，恢復後立刻補跑（10-23 曾因此 11 小時沒續期） |
+| `/diagnostics` 新增 `proxy.build`（`um_opencode_setup.py` 的 SHA256 前 12 碼） | 分得出「跑著舊碼的代理」與「已修好但沒重啟」 |
+| `um-health.py` 新增 `proxy build`、`proxy restarts (24h)` 兩列 | 前者對不上就 FAIL 並提示重啟；後者用「啟動次數多 + 目前 uptime 很短」判斷崩潰迴圈 |
+| `serve` 啟動時把超過 8 MB 的 `proxy.log` 輪替成 `proxy.log.1` | 日誌不再無限長大（24h 掃描本來就只讀尾端 4 MB） |
+| `um-models-sync.py` 代理睡著時改直連 `https://chat.genai.um.edu.mo/api/models` | 夜間 `--auto` 不再整段 `skipped: the proxy is not reachable` |
+| `setup status` / `stop` 自動偵測 8788／8787，不再假設 `DEFAULT_PORT=8787` | 以往會對健康的 8788 代理回報 `Proxy: stopped`，`stop` 也殺不到（PID 檔與 listener 不一致時改以命令列找 `serve` 進程） |
+
+用法：
+
+```powershell
+python C:\Users\TINGOD\Documents\deepseek-harness\default-workspace\dsh-um-proxy-ondemand\scripts\um-health.py
+python C:\Users\TINGOD\.um-opencode\um_opencode_setup.py status     # 自動認 8788
+python C:\Python314\python.exe -C "import py_compile; py_compile.compile(r'C:\Users\TINGOD\.um-opencode\um_opencode_setup.py', doraise=True)"
+```
+
+`proxy.build` 對不上時，重啟代理讓它載入新檔：
+
+```powershell
+python C:\Users\TINGOD\.um-opencode\um_opencode_setup.py stop
+python C:\Python314\python.exe -B C:\Users\TINGOD\.um-opencode\um_opencode_setup.py serve --port 8788 --ignore-console-events --log-file C:\Users\TINGOD\.um-opencode\proxy.log
+```
