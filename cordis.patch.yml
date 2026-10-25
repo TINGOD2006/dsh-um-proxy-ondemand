@@ -1,0 +1,9 @@
+# 只在 DSH 真的使用 um-genai provider 時喚醒本機 UM 代理（127.0.0.1:8788），
+# 最後一次使用後閒置 15 分鐘就把它關掉。
+# 代理的啟動/停止邏輯在 lib/proxy.js；事件接線在 lib/index.js。
+- insert:
+    - id: dsh-um-proxy-ondemand
+      name: dsh-um-proxy-ondemand
+      config:
+        port: 8788
+        idleMinutes: 15

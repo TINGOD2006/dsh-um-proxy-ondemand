@@ -1,0 +1,60 @@
+{
+  "_comment": "Model metadata for the UM GenAI proxy models, keyed by family (an upstream id with its trailing -NNNN version stripped, e.g. DeepSeek-V4.1-Flash-1017 -> DeepSeek-V4.1-Flash). um-models-sync.py uses this to rebuild the DSH profile and OpenCode model lists when the gateway renames a model; add an entry here for new model families instead of hand-editing the configs.",
+  "provider": {
+    "baseURL": "http://127.0.0.1:8788/v1",
+    "defaultContextWindow": 131072,
+    "defaultMaxTokens": 32768
+  },
+  "families": {
+    "DeepSeek-V4.1-Flash": {
+      "display": "DeepSeek V4.1 Flash (UM - coding agent)",
+      "contextWindow": 192768,
+      "maxTokens": 32768,
+      "tool_call": true,
+      "temperature": true
+    },
+    "Qwen3.5-397B-A17B": {
+      "display": "Qwen 3.5 397B A17B (UM - coding agent)",
+      "contextWindow": 262144,
+      "maxTokens": 32768,
+      "tool_call": true,
+      "temperature": true
+    },
+    "GLM-5.3-Flash": {
+      "display": "GLM 5.3 Flash (UM)",
+      "contextWindow": 131072,
+      "maxTokens": 32768,
+      "tool_call": true,
+      "temperature": true
+    },
+    "Qwen3.8-27B": {
+      "display": "Qwen 3.8 27B (UM)",
+      "contextWindow": 131072,
+      "maxTokens": 16384,
+      "tool_call": true,
+      "temperature": true
+    },
+    "gpt-oss-120b": {
+      "display": "GPT-OSS 120B (UM)",
+      "contextWindow": 32768,
+      "maxTokens": 8192,
+      "tool_call": true,
+      "temperature": true
+    },
+    "gemma-4-31B-it": {
+      "display": "Gemma 4 31B IT (UM - chat)",
+      "contextWindow": 32768,
+      "maxTokens": 8192,
+      "tool_call": false,
+      "temperature": true
+    },
+    "GLM-OCR": {
+      "display": "GLM OCR (UM)",
+      "contextWindow": 8192,
+      "maxTokens": 4096,
+      "tool_call": false,
+      "temperature": false,
+      "attachment": true
+    }
+  }
+}

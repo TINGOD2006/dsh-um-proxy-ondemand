@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# python bytecode / caches
+__pycache__/
+*.py[cod]
+
+# logs and runtime state written by the scripts
+*.log
+*.state.json
+*.bak
+*.bak-*
+
+# local secrets / throwaway probes
+.env
+.env.*
+.credtest

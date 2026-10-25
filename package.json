@@ -1,0 +1,23 @@
+{
+  "name": "dsh-um-proxy-ondemand",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Wake the local UM GenAI proxy (127.0.0.1:8788) only when DSH actually uses the um-genai provider, and stop it after an idle period.",
+  "type": "module",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "scripts": {
+    "um:recover": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/um-recover.ps1",
+    "um:renew": "C:\\Python314\\pythonw.exe -B scripts/um-renew.py",
+    "um:models": "C:\\Python314\\python.exe -B scripts/um-models-sync.py",
+    "um:models:apply": "C:\\Python314\\python.exe -B scripts/um-models-sync.py --apply",
+    "um:health": "C:\\Python314\\python.exe -B scripts/um-health.py",
+    "test:unit": "node test/efficiency_unit.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
