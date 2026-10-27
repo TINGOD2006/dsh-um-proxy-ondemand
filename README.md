@@ -454,6 +454,24 @@ python C:\Python314\python.exe -B C:\Users\TINGOD\.um-opencode\um_opencode_setup
 - 模型同步以獨立的 OS 鎖保護每個設定檔，使用唯一暫存檔與備份名稱；先備份全部目標，再寫入。中途失敗時回復已寫入且未被別人再修改的檔案，並保留備份。`.models-sync.lock` 側檔會持續存在；純檢查模式不建立鎖、備份或日誌。`--apply`／`--auto`／`--check` 互斥；異常或重複模型 ID 會拒絕同步。上游明確撤回圖片能力時也會覆寫註冊表中的舊宣告。
 - `um-recover.ps1` 區分 gateway 拒絕與網路未知，不以模糊的 `healthy` 字串或本機 models 200 就宣告上游正常；登入後會再探測 gateway。
 
+### 2026-10-27 17:55：token 在 `exp` 之前就被 gateway 丟掉
+
+兩次事故（10-25 13:07 發、14:08 起 401；10-27 16:52 發、約 17:52 起 401）都是同一個形狀：
+JWT 的 `exp` 還有 8 小時以上，gateway 卻已經不認這個 session。也就是說 **`exp` 是上限，不是保證**，
+伺服端會在簽發後約一小時內結束 session。
+
+- `um-renew.py` 改為「按年齡續期」：`MAX_TOKEN_AGE_SECONDS = 50 分鐘`，超過就主動換，不等 `exp` 逼近。
+- gateway 探測失敗會重試一次（15 秒逾時 × 2）：10-27 那次就是一顆 15 秒逾時把續期跳過去了，
+  下一秒請求就吃到 401。
+- 若兩次探測都連不上，但 token 已超過 40 分鐘，仍照樣續期（寧可多換一次，也不要讓使用者看到 401）。
+- `open_login_window()` 的「等除錯埠」由 8 秒放寬到 20 秒，`auto_login()` 找不到視窗時最多重試 3 次並各等 1 秒：
+  17:55 那次代理端記的是 `auto-login skipped: no login window with a debug port is open.`，
+  其實只是 Chrome 還沒把埠開出來。
+- 續期後仍會用 gateway 驗一次；被拒就記 `token rejected by the gateway right after login` 並退避，不寫假的成功。
+
+驗證：`um-renew.py --status` 顯示 `issued at` 與新的續期條件；`--probe` 回 `gateway: ok (HTTP 200)`；
+token 有效時排程本體 372 ms 靜默結束；`um-health.py` 的 `gateway accepts token` 為 HTTP 200。
+
 可重複執行的隔離回歸測試：
 
 ```powershell

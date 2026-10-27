@@ -64,6 +64,14 @@ PROBE_PATH = "/api/models"
 PROBE_TIMEOUT = 15.0
 
 LEAD_SECONDS = 20 * 60  # renew this long before the JWT expires
+# The gateway stops honouring a session token long before the JWT's exp says so:
+# 2026-10-25 13:07 issued -> rejected from 14:08, 2026-10-27 16:52 issued ->
+# rejected by 17:52, both with a ~9 hour exp claim. Refresh on age, not on exp,
+# so a server-side cutoff never turns into a 401 the user has to notice.
+MAX_TOKEN_AGE_SECONDS = 50 * 60
+# A probe that only times out (gateway hiccup) must not postpone a refresh that
+# the token's age already justifies, so age wins once the retries are spent.
+PROBE_ERROR_AGE_SECONDS = 40 * 60
 LOGIN_TIMEOUT_SECONDS = 120
 FAIL_BACKOFF_SECONDS = 15 * 60  # do not retry a failed login more often than this
 
@@ -132,13 +140,26 @@ def describe(exp: float | None, now: float) -> str:
     return f"valid until {local_time(exp)} ({int(remaining // 60)} min left)"
 
 
-def gateway_check(token: str) -> tuple[str, str]:
+def gateway_check(token: str, attempts: int = 2) -> tuple[str, str]:
     """Ask the UM gateway whether it still accepts this token.
 
     Returns (state, detail) where state is "ok", "rejected" or "error".
     "error" means the network or gateway is unavailable: that is not the token's
-    fault, so the caller must not trigger a renewal for it.
+    fault, so the caller must not trigger a renewal for it. A transient timeout
+    is retried once: on 2026-10-27 a single 15 s timeout at 17:52 was enough to
+    skip the refresh that the expired session needed.
     """
+    state, detail = ("error", "not attempted")
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            time.sleep(1.5)
+        state, detail = _gateway_check_once(token)
+        if state != "error":
+            return state, detail
+    return state, detail
+
+
+def _gateway_check_once(token: str) -> tuple[str, str]:
     if not token:
         return "rejected", "no token stored"
     request = urllib.request.Request(f"{UPSTREAM_BASE}{PROBE_PATH}")
@@ -165,8 +186,12 @@ def gateway_check(token: str) -> tuple[str, str]:
         return "error", f"{type(exc).__name__}: {exc}"
 
 
-def needs_renewal(exp: float | None, now: float) -> bool:
-    return exp is None or exp - now <= LEAD_SECONDS
+def needs_renewal(exp: float | None, now: float, issued: float | None = None) -> bool:
+    """True when the token should be replaced before the next request needs it."""
+    if exp is None or exp - now <= LEAD_SECONDS:
+        return True
+    # exp is optimistic: the gateway drops sessions well before that.
+    return issued is not None and now - issued >= MAX_TOKEN_AGE_SECONDS
 
 
 _lock_handle = None
@@ -375,7 +400,8 @@ def main() -> int:
         print(f"token state: {state}")
         if issued:
             print(f"issued at  : {local_time(issued)} ({int((now - issued) // 60)} min ago)")
-        print(f"renew when : expired, less than {LEAD_SECONDS // 60} min left, or the gateway rejects it")
+        print(f"renew when : expired, less than {LEAD_SECONDS // 60} min left, older than "
+              f"{MAX_TOKEN_AGE_SECONDS // 60} min, or the gateway rejects it")
         print(f"log file   : {LOG_FILE}")
         return 0
 
@@ -385,7 +411,9 @@ def main() -> int:
         print(f"gateway    : {probe_state} ({detail})")
         return 0 if probe_state == "ok" else (2 if probe_state == "rejected" else 3)
 
-    renewal_due = args.force or needs_renewal(exp, now)
+    renewal_due = args.force or needs_renewal(exp, now, issued)
+    if not renewal_due and issued is not None and now - issued >= MAX_TOKEN_AGE_SECONDS:
+        renewal_due = True
     probe_state, probe_detail = ("unknown", "not probed")
     if not renewal_due:
         # exp says "fine", but the gateway can disagree. Trust the gateway.
@@ -396,9 +424,18 @@ def main() -> int:
 
     if not renewal_due:
         if probe_state == "error":
-            log(f"gateway probe unavailable ({probe_detail}); leaving token unchanged")
-            return 3
-        return 0
+            age = int((now - issued) // 60) if issued is not None else None
+            if age is not None and now - issued >= PROBE_ERROR_AGE_SECONDS:
+                log(
+                    f"gateway probe unavailable ({probe_detail}) but the token is {age} min old; "
+                    "renewing anyway"
+                )
+                renewal_due = True
+            else:
+                log(f"gateway probe unavailable ({probe_detail}); leaving token unchanged")
+                return 3
+        else:
+            return 0
 
     wait = 0.0 if args.force else in_backoff(now)
     if wait > 0:
@@ -410,7 +447,7 @@ def main() -> int:
         return 1
     try:
         # Another renewal may have completed between the probe and this lock.
-        if not args.force and not needs_renewal(token_expiry(), time.time()):
+        if not args.force and not needs_renewal(token_expiry(), time.time(), token_issued()):
             current_state, _ = gateway_check(read_token())
             if current_state == "ok":
                 return 0
