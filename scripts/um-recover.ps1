@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     UM GenAI 本機反代（127.0.0.1:8788）一鍵診斷／修復。
@@ -148,7 +148,7 @@ if (-not $health) {
   exit 3
 }
 if ($health.service -ne 'um-opencode-proxy') {
-  Write-Warn "8788 有服務回應，但不是 UM 代理（service=$($health.service)）"
+  Write-Warn "$Port 有服務回應，但不是 UM 代理（service=$($health.service)）"
   Write-Info '外掛會拒絕在這個埠啟動，先查是誰佔用。'
   exit 4
 }
@@ -158,13 +158,17 @@ Write-Ok "um-opencode-proxy 正在服務（status=$($health.status)）"
 Write-Step '2/3 上游 UM 登入狀態（setup status）'
 $statusOut     = @(& $python $setup status --port $Port 2>&1 | ForEach-Object { [string]$_ })
 $statusText    = $statusOut -join "`n"
-$upstreamOk    = $statusText -match 'healthy'
+$statusCode    = $LASTEXITCODE
+$upstreamOk    = $statusCode -eq 0 -and $statusText -match '(?im)^Upstream \(UM\)\s*:\s*healthy\b'
+$upstreamRejected = $statusCode -eq 0 -and $statusText -match '(?im)^Upstream \(UM\)\s*:\s*HTTP (401|403)\b'
 $statusOut | ForEach-Object { Write-Info $_ }
 
 if ($upstreamOk) {
   Write-Ok '上游 UM 接受目前的 token'
-} else {
+} elseif ($upstreamRejected) {
   Write-Bad '上游 UM 不接受目前的 token（過期或被撤銷）'
+} else {
+  Write-Warn '無法確認上游 token：可能是網路或 gateway 故障，不能據此判定需要重新登入。'
 }
 
 $tokenExp = Get-TokenExpiry
@@ -179,14 +183,25 @@ Write-Step '3/3 API /v1/models（帶 local-api-key）'
 $api = Test-Api -Key $key
 switch ($api.Code) {
   200 {
-    Write-Ok 'models 200 — 反代可用，不需要修復。'
-    exit 0
+    if ($upstreamOk) {
+      Write-Ok 'models 200 且 gateway 接受 token — 反代可用。'
+      exit 0
+    }
+    if (-not $upstreamRejected) {
+      Write-Warn '本機 models 可用，但上游狀態未確認；稍後重試，不自動重新登入。'
+      exit 2
+    }
+    Write-Bad '本機 models 可用，但 gateway 已拒絕 token，需要重新登入。'
   }
   401 {
     if ($upstreamOk) {
       Write-Bad '401（上游 token 健康）⇒ 問題在 local-api-key，不在 UM 登入。'
       Write-Info "確認 $keyFile 的內容與 DSH profile 的 UM_GENAI_API_KEY 一致。"
       Write-Info '重新登入不會修好這個情況。'
+      exit 2
+    }
+    if (-not $upstreamRejected) {
+      Write-Warn '401 但未確認 gateway 拒絕 token；先檢查 local-api-key 與網路，不自動重新登入。'
       exit 2
     }
     Write-Bad '401 ⇒ 上游 UM 登入 token 過期／被拒，需要重新登入。'
@@ -220,6 +235,12 @@ if ($rc -ne 0) {
 }
 
 Start-Sleep -Milliseconds 500
+$probeScript = Join-Path $PSScriptRoot 'um-renew.py'
+& $python -B $probeScript --probe
+if ($LASTEXITCODE -ne 0) {
+  Write-Bad '登入後 gateway 仍未確認 token 可用。'
+  exit 2
+}
 $api2 = Test-Api -Key $key
 if ($api2.Code -eq 200) {
   Write-Ok '修好了：models 200，反代恢復正常。'

@@ -31,10 +31,10 @@ DSH 關閉 → 順手關掉代理（不留孤兒行程）
 | 掛 `llm/stream` 瀑布事件 | `options.provider` 是唯一能精準判斷「這次要用哪個 provider」的時點；hooks 橋接只看得到會話/提示詞，無法區分模型。 |
 | 回傳 async generator，在裡面才 `await ensureProxy()` | 瀑布事件必須回傳 `AsyncIterable<StreamChunk>`。把監聽器寫成 async 函式會回傳 Promise，是否被上游 await 屬 DSH 內部實作，不該賭。 |
 | 依 `options.provider` 而非 model id 判斷 | provider 名稱穩定；模型清單會變（`DeepSeek-V4.1-Flash`、`Qwen3.5-397B-A17B`…）。 |
-| 用 `/health` 的 `service == "um-opencode-proxy"` 確認所有權 | 才敢 `taskkill`。埠上若是別的服務，寧可報錯也不誤殺。 |
+| `/health` 要求 HTTP 200 且 `service` 相符 | 健康探測有獨立的總逾時、64 KiB 上限，503／截斷／異常 JSON 都不算健康。終止行程另核對命令列，不能只信 service 標籤。 |
 | 用自己的 state 檔，不用 `proxy.pid` | `proxy.pid` 是 8787 的 `um_windows.py ensure` 在用的單一檔案，共用會互相覆蓋。 |
-| 停止時殺**所有**監聽者 | Windows 的 `SO_REUSEADDR` 加上 Python `HTTPServer.allow_reuse_address=1`，允許兩個行程同時 LISTENING 同一個埠（舊的保活排程就製造過這種情況）。 |
-| 停止時以 netstat 的實際監聽者為準，不無條件信 `state.pid` | Windows 會回收 pid；舊狀態檔裡的 pid 可能已被無關行程接手，照殺就是誤殺。只有在 netstat 查不到時才退回 `state.pid`。 |
+| 停止時檢查所有監聽者，只終止確認屬於此代理者 | 每個 PID 都須符合 Python 路徑、完整腳本路徑、`serve` 與埠號；外來服務會保留並回報停止未完成。 |
+| 不以 `state.pid` 作為終止依據 | Windows 會回收 PID。netstat 或 CIM 無法確認時會回報失敗，不退回舊狀態檔猜測。 |
 | 冷啟動時 `detached + windowsHide`，對象是 `pythonw.exe` | GUI 子系統 ＋ `DETACHED_PROCESS` ⇒ 不產生任何主控台視窗（已實測，見下）。 |
 
 ## 效率：熱路徑與喚醒延遲
@@ -46,7 +46,7 @@ DSH 關閉 → 順手關掉代理（不留孤兒行程）
 | --- | --- | --- | --- |
 | 冷喚醒（spawn → 可服務） | 281–344 ms | **177 ms** | 輪詢排程由固定 250ms 改成 20→250ms 前密後疏，且 spawn 後先立刻探一次。 |
 | 並行冷啟動 | 每個請求各 spawn 一次（實測 2 個 python，1 個 bind 失敗退出） | **只 spawn 1 次** | 同埠 `singleFlight()`：進行中的喚醒共用同一個 promise。 |
-| 熱路徑（代理已活著） | 1 次 health ＋ 同步 `netstat`（~31ms，卡 event loop）＋ 每請求同步寫 state | **1 次 health（0.25ms）** | `healthDetail()` 分辨 `ECONNREFUSED`＝真的沒人聽 ⇒ 直接 spawn，省掉 netstat；只有「有回應但不是我們的代理」才去查誰佔著埠。 |
+| 熱路徑（代理已活著） | 1 次 health ＋ 同步 `netstat`（~31ms，卡 event loop）＋ 每請求同步寫 state | **1 次 health；自啟代理可沿用存活的子行程 handle** | `healthDetail()` 分辨 `ECONNREFUSED`＝真的沒人聽 ⇒ 直接 spawn，省掉 netstat；只有「有回應但不是我們的代理」才去查誰佔著埠。 |
 | 狀態檔寫入 | 每請求同步寫一次 | 記憶體最新，磁碟最多每 15s | 喚醒、停止、DSH 關閉時 `flushState()` 立刻落盤。 |
 
 其餘刻意**不做**的取捨：`/health` 用 keep-alive agent 實測沒有增益（0.25 對 0.25ms）；
@@ -436,3 +436,31 @@ python C:\Python314\python.exe -C "import py_compile; py_compile.compile(r'C:\Us
 python C:\Users\TINGOD\.um-opencode\um_opencode_setup.py stop
 python C:\Python314\python.exe -B C:\Users\TINGOD\.um-opencode\um_opencode_setup.py serve --port 8788 --ignore-console-events --log-file C:\Users\TINGOD\.um-opencode\proxy.log
 ```
+
+
+## 穩定性修正（2026-10-27）
+
+這輪保留 DSH 的 provider／串流介面，修正生命週期與輔助腳本：
+
+- 健康檢查要求 HTTP 200、正確 service、完整 JSON，限制回應 64 KiB；總逾時不會被持續傳送的小封包延長。`service` 設定也會實際生效。
+- 每個埠的啟動／停止依呼叫順序排隊，並行喚醒共用結果。Python 啟動失敗會正常回傳錯誤；提早退出不再等完整逾時，逾時後先回收自己啟動的子行程，最多補救一次。
+- 實際生命週期使用非同步 netstat／CIM／taskkill，避免 Windows 子命令阻塞 DSH 的 event loop。自啟代理的熱路徑沿用 ChildProcess handle；沿用外部代理時可能另查非同步 netstat。前文延遲數字是早期版本的歷史測量，未代表本輪效能基準。
+- 終止前逐一核對 Python 安裝路徑（同目錄的 python.exe／pythonw.exe 視為同一組）、完整腳本路徑、`serve` 與唯一埠號。無法確認時保留行程，不使用舊 PID 檔補猜。
+- 啟動清理讓新請求優先；閒置停止開始後，新請求等待停止完成再喚醒。串流進行中不啟動閒置計時；卸載時等待目前串流結束，再清理代理，不重新布署計時器。停止失敗會保留錯誤並於下個閒置週期重試。
+- 狀態檔以暫存檔原子替換；節流期間讀取可取得記憶體中的最新狀態。port、啟動逾時與閒置時間會先驗證。
+- 續期改用作業系統檔案鎖，無法取得鎖時不登入；行程退出後自動釋放，不因鎖檔年齡而驅逐仍在工作的行程。`renew-watchdog.lock` 會保留在磁碟，檔案存在不代表鎖仍被持有。
+- Chrome 清理限定完整 `--user-data-dir` 路徑，不匹配其他同名 browser-profile；保留 debug 模式與 renderer／utility 子行程。gateway 探測須取得真正的模型 JSON；網路故障回傳 3，登入後無法確認 token 時回報失敗並退避。
+- 健康工具對異常 JSON／JWT 回報失敗項目並繼續檢查；HTTP 503 不再當成休眠，停用排程會警告，CSV 日期中含逗號也能解析；看門狗日誌只讀最後 64 KiB。
+- 模型同步以獨立的 OS 鎖保護每個設定檔，使用唯一暫存檔與備份名稱；先備份全部目標，再寫入。中途失敗時回復已寫入且未被別人再修改的檔案，並保留備份。`.models-sync.lock` 側檔會持續存在；純檢查模式不建立鎖、備份或日誌。`--apply`／`--auto`／`--check` 互斥；異常或重複模型 ID 會拒絕同步。上游明確撤回圖片能力時也會覆寫註冊表中的舊宣告。
+- `um-recover.ps1` 區分 gateway 拒絕與網路未知，不以模糊的 `healthy` 字串或本機 models 200 就宣告上游正常；登入後會再探測 gateway。
+
+可重複執行的隔離回歸測試：
+
+```powershell
+npm test
+```
+
+需要 Node.js 24（外掛接線測試使用實驗性的 module mock）與 `C:\Python314\python.exe`。
+`npm test` 不啟停正式 8788、不開真實登入瀏覽器、不讀真實憑證：生命週期測試在隨機回環埠啟停 `test/fixtures/proxy.py`，其餘登入／排程／設定檔故障由 mock 與暫存檔驗證。自訂測試 Python 可設定 `UM_TEST_PYTHON`；這不改變正式代理的 Python 設定。
+
+本輪部署後須重啟 DSH host 才會重新載入 JS；排程腳本於下次排程執行時載入新碼。這裡的自動化測試不等於已完成真實 DSH 對話或 Duo 登入驗證。

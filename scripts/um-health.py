@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
+import math
 import hashlib
 import json
 import pathlib
@@ -64,7 +66,13 @@ def http_json(url: str, token: str | None = None, timeout: float = 5.0):
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.status, json.loads(response.read().decode("utf-8", "replace"))
+        raw = response.read(2 * 1024 * 1024 + 1)
+        if len(raw) > 2 * 1024 * 1024:
+            raise ValueError("JSON response exceeds 2 MiB")
+        payload = json.loads(raw.decode("utf-8", "replace"))
+        if not isinstance(payload, dict):
+            raise ValueError("expected a JSON object")
+        return response.status, payload
 
 
 def read_text(path: pathlib.Path) -> str:
@@ -81,16 +89,19 @@ def jwt_expiry(token: str) -> float | None:
     payload = parts[1] + "=" * (-len(parts[1]) % 4)
     try:
         data = json.loads(base64.urlsafe_b64decode(payload))
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, UnicodeError):
         return None
-    exp = data.get("exp")
-    return float(exp) if isinstance(exp, (int, float)) else None
+    exp = data.get("exp") if isinstance(data, dict) else None
+    return float(exp) if type(exp) in (int, float) and math.isfinite(exp) else None
 
 
 def check_proxy(checks: Checks, base_url: str) -> None:
     try:
-        with urllib.request.urlopen(f"{base_url.rsplit('/v1', 1)[0]}/health", timeout=2.0) as response:
-            payload = json.loads(response.read().decode("utf-8", "replace"))
+        _, payload = http_json(f"{base_url.rsplit('/v1', 1)[0]}/health", timeout=2.0)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        checks.add(FAIL, "/health", f"proxy answered HTTP {exc.code}")
+        return
     except (urllib.error.URLError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         checks.add(WARN, "/health", f"proxy is asleep or down ({reason}) - it wakes on the next um-genai request")
@@ -108,17 +119,18 @@ def check_models(checks: Checks, base_url: str, key_file: pathlib.Path) -> None:
         checks.add(FAIL, "local api key", f"{key_file} is empty or missing")
         return
     try:
-        request = urllib.request.Request(f"{base_url}/models", headers={"Authorization": f"Bearer {key}"})
-        with urllib.request.urlopen(request, timeout=20.0) as response:
-            payload = json.loads(response.read().decode("utf-8", "replace"))
+        _, payload = http_json(f"{base_url}/models", token=key, timeout=20.0)
     except urllib.error.HTTPError as exc:
+        exc.close()
         level = FAIL if exc.code in (401, 403) else WARN
         checks.add(level, "/v1/models", f"HTTP {exc.code}")
         return
     except (urllib.error.URLError, OSError) as exc:
         checks.add(WARN, "/v1/models", f"not reachable ({getattr(exc, 'reason', exc)})")
         return
-    models = payload.get("data") or []
+    models = payload.get("data", [])
+    if not isinstance(models, list):
+        raise ValueError("models data must be an array")
     names = [item.get("id") for item in models if isinstance(item, dict)]
     detail = f"{len(names)} models"
     if names:
@@ -136,6 +148,7 @@ def check_diagnostics(
     try:
         status, payload = http_json(f"{root}/diagnostics?probe=1&log=1", token=key, timeout=30.0)
     except urllib.error.HTTPError as exc:
+        exc.close()
         if exc.code == 404:
             checks.add(WARN, "/diagnostics", "not available on this proxy build - restart the proxy to enable it")
             return False
@@ -145,6 +158,9 @@ def check_diagnostics(
         checks.add(WARN, "/diagnostics", f"not reachable ({getattr(exc, 'reason', exc)})")
         return False
 
+    for field in ("proxy", "stats", "token", "upstream", "log"):
+        if field in payload and not isinstance(payload[field], dict):
+            raise ValueError(f"diagnostics {field} must be an object")
     proxy = payload.get("proxy") or {}
     stats = payload.get("stats") or {}
     checks.add(
@@ -256,6 +272,7 @@ def check_gateway(checks: Checks, install_dir: pathlib.Path) -> None:
         with urllib.request.urlopen(request, timeout=15.0) as response:
             checks.add(OK, "gateway accepts token", f"HTTP {response.status} from {UPSTREAM_BASE}")
     except urllib.error.HTTPError as exc:
+        exc.close()
         if exc.code in (401, 403):
             checks.add(
                 FAIL,
@@ -269,7 +286,13 @@ def check_gateway(checks: Checks, install_dir: pathlib.Path) -> None:
 
 
 def check_watchdog(checks: Checks, log_path: pathlib.Path) -> None:
-    text = read_text(log_path)
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, 2)
+            handle.seek(max(0, handle.tell() - 65536))
+            text = handle.read().decode("utf-8", "replace").strip()
+    except OSError:
+        text = ""
     if not text:
         checks.add(WARN, "renew watchdog", f"{log_path} is empty or missing")
         return
@@ -298,11 +321,24 @@ def check_tasks(checks: Checks) -> None:
         if completed.returncode != 0:
             checks.add(FAIL, f"task {task}", "not found (schtasks reported an error)")
             continue
-        columns = [cell.strip().strip('"') for cell in completed.stdout.splitlines()[0].split(",")]
+        rows = list(csv.reader(completed.stdout.splitlines()))
+        if not rows or len(rows[0]) < 3:
+            checks.add(WARN, f"task {task}", "empty or malformed schtasks output")
+            continue
+        columns = [cell.strip() for cell in rows[0]]
         status = columns[2] if len(columns) > 2 else "unknown"
         next_run = columns[1] if len(columns) > 1 else "unknown"
-        level = OK if status.lower() in {"ready", "running", "disabled"} else WARN
+        level = OK if status.lower() in {"ready", "running", "就緒", "準備就緒", "執行中", "正在執行"} else WARN
         checks.add(level, f"task {task}", f"status {status}, next run {next_run}")
+
+
+def run_check(checks: Checks, name: str, callback, *args):
+    """A malformed endpoint must produce a failed row, not abort all checks."""
+    try:
+        return callback(checks, *args)
+    except (ValueError, TypeError, AttributeError, KeyError, OverflowError):
+        checks.add(FAIL, name, "invalid or malformed response data")
+        return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -321,14 +357,14 @@ def main(argv: list[str] | None = None) -> int:
     key_file = args.api_key_file or (args.install_dir / "local-api-key")
 
     checks = Checks()
-    check_proxy(checks, base_url)
-    check_models(checks, base_url, key_file)
-    if not check_diagnostics(checks, base_url, key_file, args.install_dir):
-        check_token_file(checks, args.install_dir)
-    check_gateway(checks, args.install_dir)
-    check_watchdog(checks, args.install_dir / "renew-watchdog.log")
+    run_check(checks, "/health", check_proxy, base_url)
+    run_check(checks, "/v1/models", check_models, base_url, key_file)
+    if not run_check(checks, "/diagnostics", check_diagnostics, base_url, key_file, args.install_dir):
+        run_check(checks, "upstream-token file", check_token_file, args.install_dir)
+    run_check(checks, "gateway accepts token", check_gateway, args.install_dir)
+    run_check(checks, "renew watchdog", check_watchdog, args.install_dir / "renew-watchdog.log")
     if not args.no_tasks:
-        check_tasks(checks)
+        run_check(checks, "scheduled tasks", check_tasks)
 
     worst = checks.worst()
     if args.json:

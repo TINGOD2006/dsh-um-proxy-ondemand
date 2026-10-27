@@ -39,6 +39,9 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
+import ctypes
+import shlex
 import os
 import pathlib
 import subprocess
@@ -63,7 +66,6 @@ PROBE_TIMEOUT = 15.0
 LEAD_SECONDS = 20 * 60  # renew this long before the JWT expires
 LOGIN_TIMEOUT_SECONDS = 120
 FAIL_BACKOFF_SECONDS = 15 * 60  # do not retry a failed login more often than this
-STALE_LOCK_SECONDS = 15 * 60
 
 
 def log(message: str) -> None:
@@ -90,7 +92,7 @@ def python_executable() -> str:
 def read_token() -> str:
     try:
         return TOKEN_FILE.read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeError):
         return ""
 
 
@@ -102,19 +104,19 @@ def token_claims() -> dict:
     payload = parts[1] + "=" * (-len(parts[1]) % 4)
     try:
         data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
 def token_expiry() -> float | None:
     exp = token_claims().get("exp")
-    return float(exp) if isinstance(exp, (int, float)) else None
+    return float(exp) if type(exp) in (int, float) and math.isfinite(exp) else None
 
 
 def token_issued() -> float | None:
     iat = token_claims().get("iat")
-    return float(iat) if isinstance(iat, (int, float)) else None
+    return float(iat) if type(iat) in (int, float) and math.isfinite(iat) else None
 
 
 def local_time(ts: float) -> str:
@@ -144,12 +146,22 @@ def gateway_check(token: str) -> tuple[str, str]:
     request.add_header("User-Agent", "UMOpenCodeProxy/1.2")
     try:
         with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
+            if response.status != 200:
+                return "error", f"HTTP {response.status}"
+            raw = response.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                return "error", "gateway model catalog exceeds 2 MiB"
+            payload = json.loads(raw.decode("utf-8"))
+            items = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(items, list):
+                return "error", "gateway did not return a model catalog"
             return "ok", f"HTTP {response.status}"
     except urllib.error.HTTPError as exc:
+        exc.close()
         if exc.code in (401, 403):
             return "rejected", f"HTTP {exc.code}"
         return "error", f"HTTP {exc.code}"
-    except (urllib.error.URLError, OSError) as exc:
+    except (urllib.error.URLError, OSError, ValueError, UnicodeError) as exc:
         return "error", f"{type(exc).__name__}: {exc}"
 
 
@@ -157,28 +169,46 @@ def needs_renewal(exp: float | None, now: float) -> bool:
     return exp is None or exp - now <= LEAD_SECONDS
 
 
+_lock_handle = None
+
+
 def acquire_lock(now: float) -> bool:
-    try:
-        if LOCK_FILE.exists() and now - LOCK_FILE.stat().st_mtime > STALE_LOCK_SECONDS:
-            LOCK_FILE.unlink()
-    except OSError:
-        pass
-    try:
-        descriptor = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
+    """Use an OS lock: crashes release it, and age never evicts a live owner.
+
+    The lock file deliberately persists; unlinking a locked file allows a second
+    inode (and a second concurrent login) on POSIX.
+    """
+    global _lock_handle
+    if _lock_handle is not None:
         return False
-    except OSError:
-        return True  # cannot lock; better to try than to stay expired
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(str(os.getpid()))
-    return True
+    handle = None
+    try:
+        HOME.mkdir(parents=True, exist_ok=True)
+        handle = open(LOCK_FILE, "a+b")
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_handle = handle
+        return True
+    except OSError as exc:
+        if handle is not None:
+            handle.close()
+        log(f"renewal lock unavailable ({type(exc).__name__}); skipping login")
+        return False
 
 
 def release_lock() -> None:
-    try:
-        LOCK_FILE.unlink()
-    except OSError:
-        pass
+    global _lock_handle
+    if _lock_handle is not None:
+        _lock_handle.close()
+        _lock_handle = None
 
 
 def in_backoff(now: float) -> float:
@@ -193,9 +223,11 @@ def in_backoff(now: float) -> float:
 def powershell(script: str, timeout: float = 30.0) -> str:
     try:
         completed = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); " + script],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -216,42 +248,70 @@ def debug_port_alive() -> bool:
         return False
 
 
-def close_stale_login_window() -> None:
-    """Kill a Chrome that holds the private login profile without a debug port.
+def command_args(command: str) -> list[str]:
+    if os.name != "nt":
+        return [part.strip('"') for part in shlex.split(command, posix=False)]
+    from ctypes import wintypes
+    parse = ctypes.windll.shell32.CommandLineToArgvW
+    parse.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    parse.restype = ctypes.POINTER(wintypes.LPWSTR)
+    count = ctypes.c_int()
+    pointer = parse(command, ctypes.byref(count))
+    if not pointer:
+        return []
+    try:
+        return [pointer[index] for index in range(count.value)]
+    finally:
+        free = ctypes.windll.kernel32.LocalFree
+        free.argtypes = [wintypes.HLOCAL]
+        free.restype = wintypes.HLOCAL
+        free(ctypes.cast(pointer, wintypes.HLOCAL))
 
-    Chrome refuses to start a second instance on the same --user-data-dir: the new
-    process only hands the URL to the old one and exits, so auto-login waits 90 s
-    and reports "auto-login skipped: no login window with a debug port is open".
-    The only fix is to close the squatter, which is a window we opened ourselves
-    for a previous login attempt.
-    """
+
+def is_private_login_process(command: str) -> bool:
+    args = command_args(command)
+    profiles = []
+    for index, arg in enumerate(args):
+        if arg.startswith("--type=") or arg == "--type":
+            return False  # only the browser root, never renderer/utility children
+        if arg.startswith("--remote-debugging-port") or arg == "--remote-debugging-pipe":
+            return False
+        if arg == "--user-data-dir" and index + 1 < len(args):
+            profiles.append(args[index + 1])
+        elif arg.startswith("--user-data-dir="):
+            profiles.append(arg.split("=", 1)[1])
+    expected = os.path.normcase(os.path.abspath(BROWSER_PROFILE))
+    return len(profiles) == 1 and os.path.normcase(os.path.abspath(profiles[0])) == expected
+
+
+def close_stale_login_window() -> None:
+    """Only close Chrome roots using this exact private profile, without debug."""
     script = (
         "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-        "Where-Object { $_.CommandLine -like '*browser-profile*' -and "
-        "$_.CommandLine -notlike '*--remote-debugging-port*' } | "
-        "ForEach-Object { $_.ProcessId }"
+        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
     )
-    output = powershell(script)
-    pids = [line.strip() for line in output.splitlines() if line.strip().isdigit()]
+    try:
+        data = json.loads(powershell(script) or "[]")
+        rows = data if isinstance(data, list) else [data]
+    except (ValueError, TypeError):
+        return
+    pids = [row.get("ProcessId") for row in rows if isinstance(row, dict)
+            and isinstance(row.get("CommandLine"), str)
+            and is_private_login_process(row["CommandLine"])]
+    pids = [pid for pid in pids if type(pid) is int and pid > 0]
     if not pids:
         return
-    log(f"closing stale Chrome holding the private profile: pid {', '.join(pids)}")
+    log(f"closing stale Chrome holding the private profile: pid {', '.join(map(str, pids))}")
     for pid in pids:
         try:
             subprocess.run(
-                ["taskkill", "/PID", pid, "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
+                text=True, timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.SubprocessError):
             pass
     time.sleep(2.0)
-    try:
-        DEBUG_PORT_FILE.unlink()
-    except OSError:
-        pass
+    # The next login replaces its debug-port file; leave it alone on kill failure.
 
 
 def run_login(timeout: int) -> bool:
@@ -291,6 +351,7 @@ def run_login(timeout: int) -> bool:
         return False
     if state == "error":
         log(f"cannot confirm the fresh token yet: gateway unreachable ({detail})")
+        return False
     return True
 
 
@@ -301,6 +362,8 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="run the auto-login even if the token looks fine")
     parser.add_argument("--timeout", type=int, default=LOGIN_TIMEOUT_SECONDS, help="auto-login timeout in seconds")
     args = parser.parse_args()
+    if args.timeout <= 0 or args.timeout > 600:
+        parser.error("--timeout must be between 1 and 600 seconds")
 
     now = time.time()
     exp = token_expiry()
@@ -332,6 +395,9 @@ def main() -> int:
             renewal_due = True
 
     if not renewal_due:
+        if probe_state == "error":
+            log(f"gateway probe unavailable ({probe_detail}); leaving token unchanged")
+            return 3
         return 0
 
     wait = 0.0 if args.force else in_backoff(now)
@@ -343,6 +409,11 @@ def main() -> int:
         log(f"token is due ({state}) but another renewal is already running")
         return 1
     try:
+        # Another renewal may have completed between the probe and this lock.
+        if not args.force and not needs_renewal(token_expiry(), time.time()):
+            current_state, _ = gateway_check(read_token())
+            if current_state == "ok":
+                return 0
         if probe_state == "unknown":
             probe_state, probe_detail = gateway_check(read_token())
         log(f"token is due: {state}; gateway {probe_state} ({probe_detail})")

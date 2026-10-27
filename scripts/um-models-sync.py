@@ -54,10 +54,13 @@ import pathlib
 import re
 import shutil
 import sys
+import tempfile
+import uuid
 import time
 import urllib.error
 import urllib.request
 from collections import Counter
+from contextlib import contextmanager, ExitStack
 
 HOME = pathlib.Path.home()
 DEFAULT_PROFILE = HOME / ".dsh" / "profiles" / "desktop" / "cordis.patch.yml"
@@ -114,6 +117,20 @@ def read_upstream_token(path: pathlib.Path = DEFAULT_TOKEN) -> str:
         return ""
 
 
+def validate_catalog(payload, source: str) -> list[dict]:
+    items = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(items, list) or not items:
+        raise SyncError(f"{source} returned an empty or invalid model array")
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"].strip():
+            raise SyncError(f"{source} returned an invalid model entry")
+        if item["id"] in seen:
+            raise SyncError(f"{source} returned duplicate model ids")
+        seen.add(item["id"])
+    return items
+
+
 def fetch_catalog_direct(timeout: float = 15.0) -> list[dict]:
     """Ask the UM gateway itself, so a sleeping proxy does not skip the sync.
 
@@ -136,21 +153,20 @@ def fetch_catalog_direct(timeout: float = 15.0) -> list[dict]:
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            raw = response.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError("model catalog exceeds 2 MiB")
+            payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise SyncError("model endpoint returned invalid JSON") from exc
     except urllib.error.HTTPError as exc:
+        exc.close()
         raise SyncError(
             f"the UM gateway answered HTTP {exc.code} (run scripts/um-renew.py --force if the token was rejected)"
         ) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise SyncError(f"neither the proxy nor the UM gateway is reachable: {exc}") from exc
-    items = payload.get("data") if isinstance(payload, dict) else payload
-    catalog = [
-        item
-        for item in (items or [])
-        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
-    ]
-    if not catalog:
-        raise SyncError("the UM gateway returned an empty model list")
+    catalog = validate_catalog(payload, "UM gateway")
     CATALOG_SOURCE = "gateway"
     return catalog
 
@@ -163,8 +179,14 @@ def fetch_catalog(base_url: str, api_key: str, timeout: float = 15.0) -> list[di
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            raw = response.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError("model catalog exceeds 2 MiB")
+            payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise SyncError("model endpoint returned invalid JSON") from exc
     except urllib.error.HTTPError as exc:
+        exc.close()
         raise SyncError(f"the proxy answered HTTP {exc.code} for /v1/models (is the api key right?)") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         try:
@@ -173,15 +195,7 @@ def fetch_catalog(base_url: str, api_key: str, timeout: float = 15.0) -> list[di
             raise SyncError(
                 f"the proxy is not reachable at {base_url}: {exc}; {fallback}"
             ) from exc
-    items = payload.get("data") if isinstance(payload, dict) else payload
-    catalog = [
-        item
-        for item in (items or [])
-        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
-    ]
-    if not catalog:
-        raise SyncError("the proxy returned an empty model list")
-    return catalog
+    return validate_catalog(payload, "proxy")
 
 
 def fetch_models(base_url: str, api_key: str, timeout: float = 15.0) -> list[str]:
@@ -213,6 +227,13 @@ def load_registry(path: pathlib.Path) -> dict:
         raise SyncError(f"cannot read the model registry {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise SyncError(f"the model registry {path} is not valid JSON: {exc}") from exc
+    if not isinstance(registry, dict):
+        raise SyncError("the model registry must be a JSON object")
+    for field in ("provider", "families"):
+        if not isinstance(registry.get(field, {}), dict):
+            raise SyncError(f"registry {field} must be an object")
+    if any(not isinstance(value, dict) for value in registry.get("families", {}).values()):
+        raise SyncError("registry family entries must be objects")
     return registry
 
 
@@ -235,11 +256,14 @@ def upstream_context_of(info: dict) -> int | None:
     return value
 
 
-def upstream_attachment_of(info: dict) -> bool:
+def upstream_attachment_of(info: dict) -> bool | None:
     info_block = info.get("info") if isinstance(info.get("info"), dict) else {}
     meta = info_block.get("meta") if isinstance(info_block.get("meta"), dict) else {}
     capabilities = meta.get("capabilities") if isinstance(meta.get("capabilities"), dict) else {}
-    return any(bool(capabilities.get(key)) for key in ("vision", "file_upload", "file_context"))
+    keys = ("vision", "file_upload", "file_context")
+    if not any(key in capabilities for key in keys):
+        return None
+    return any(capabilities.get(key) is True for key in keys)
 
 
 def modalities_for(attachment: bool) -> list[str]:
@@ -281,8 +305,8 @@ def metadata_for(model_id: str, registry: dict, info: dict, warnings: list[str])
             "maxTokens": min(default_max, context),
             "tool_call": True,
             "temperature": True,
-            "attachment": gateway_attachment,
-            "input": modalities_for(gateway_attachment),
+            "attachment": bool(gateway_attachment),
+            "input": modalities_for(bool(gateway_attachment)),
             "nameSource": name_source,
             "ctxSource": "gateway" if gateway_context else "default",
         }
@@ -292,7 +316,7 @@ def metadata_for(model_id: str, registry: dict, info: dict, warnings: list[str])
     else:
         display, name_source = entry.get("display", model_id), "registry"
     context = gateway_context or int(entry.get("contextWindow", default_context))
-    attachment = bool(entry.get("attachment", False)) or gateway_attachment
+    attachment = gateway_attachment if gateway_attachment is not None else bool(entry.get("attachment", False))
     return {
         "display": display,
         "contextWindow": context,
@@ -367,6 +391,8 @@ def verify(
     for entry in entries:
         if entry["contextWindow"] <= 0:
             failures.append(f"{entry['id']}: contextWindow must be positive")
+        if entry["maxTokens"] <= 0:
+            failures.append(f"{entry['id']}: maxTokens must be positive")
         if entry["maxTokens"] > entry["contextWindow"]:
             failures.append(
                 f"{entry['id']}: maxTokens {entry['maxTokens']} exceeds contextWindow {entry['contextWindow']}"
@@ -553,15 +579,84 @@ def read_text(path: pathlib.Path) -> str:
 
 def backup(path: pathlib.Path) -> pathlib.Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    target = path.with_name(f"{path.name}.bak-models-{stamp}")
+    target = path.with_name(f"{path.name}.bak-models-{stamp}-{uuid.uuid4().hex[:8]}")
     shutil.copy2(path, target)
     return target
 
 
 def write_text(path: pathlib.Path, text: str) -> None:
-    temporary = path.with_name(path.name + ".tmp-models")
-    temporary.write_text(text, encoding="utf-8", newline="")
-    os.replace(temporary, path)
+    descriptor, name = tempfile.mkstemp(prefix=path.name + ".tmp-models-", dir=path.parent)
+    temporary = pathlib.Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def config_lock(path: pathlib.Path):
+    """Lock a persistent sidecar so atomic replacement cannot replace the lock."""
+    try:
+        handle = open(path.with_name(path.name + ".models-sync.lock"), "a+b")
+    except OSError as exc:
+        raise SyncError(f"cannot lock {path}; settings were not changed") from exc
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise SyncError(f"another model sync owns {path}; retry later") from exc
+        yield
+    finally:
+        handle.close()
+
+
+def apply_plans(plans, log_file) -> None:
+    """Lock all targets in a stable order before checking or changing inputs."""
+    with ExitStack() as stack:
+        for path in sorted({plan[0].resolve() for plan in plans}, key=str):
+            stack.enter_context(config_lock(path))
+        _apply_locked(plans, log_file)
+
+
+def _apply_locked(plans, log_file) -> None:
+    """Back up every input first; restore completed writes on partial failure."""
+    for path, original, _, _ in plans:
+        if read_text(path) != original:
+            raise SyncError(f"{path} changed during sync; retry with the current settings")
+    saved = [(plan, backup(plan[0])) for plan in plans]
+    written = []
+    try:
+        for (path, original, _, new_text), saved_path in saved:
+            if read_text(path) != original:
+                raise SyncError(f"{path} changed during sync")
+            write_text(path, new_text)
+            written.append((path, original, new_text))
+            log(f"rewrote {path} (backup: {saved_path.name})", log_file)
+    except (OSError, SyncError) as exc:
+        rollback_errors = []
+        for path, original, new_text in reversed(written):
+            try:
+                if read_text(path) == new_text:
+                    write_text(path, original)
+                else:
+                    rollback_errors.append(str(path))
+            except (OSError, SyncError):
+                rollback_errors.append(str(path))
+        detail = f"; restore backups manually for: {', '.join(rollback_errors)}" if rollback_errors else "; completed writes rolled back"
+        raise SyncError(f"model sync did not complete: {type(exc).__name__}{detail}") from exc
 
 
 # ---------------------------------------------------------------- main
@@ -569,9 +664,10 @@ def write_text(path: pathlib.Path, text: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--apply", action="store_true", help="rewrite the configs")
-    parser.add_argument("--auto", action="store_true", help="rewrite only when there is drift, stay quiet otherwise")
-    parser.add_argument("--check", action="store_true", help="read-only drift check (this is already the default; the flag is accepted for scripts)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="rewrite the configs")
+    mode.add_argument("--auto", action="store_true", help="rewrite only when there is drift, stay quiet otherwise")
+    mode.add_argument("--check", action="store_true", help="read-only drift check (this is already the default; the flag is accepted for scripts)")
     parser.add_argument("--target", default="both", choices=["both", "dsh", "opencode"])
     parser.add_argument("--profile", type=pathlib.Path, default=DEFAULT_PROFILE)
     parser.add_argument("--opencode", type=pathlib.Path, default=DEFAULT_OPENCODE)
@@ -582,7 +678,7 @@ def main() -> int:
     args = parser.parse_args()
 
     quiet = args.auto
-    log_file = args.log if (args.apply or args.auto or not quiet) else None
+    log_file = args.log if (args.apply or args.auto) else None
     registry = load_registry(args.registry)
     base_url = args.base_url or registry.get("provider", {}).get("baseURL", "http://127.0.0.1:8788/v1")
     api_key = read_api_key(args.api_key_file)
@@ -642,10 +738,7 @@ def main() -> int:
         log("drift detected; re-run with --apply to rewrite the configs", log_file)
         return 10
 
-    for path, _, _, new_text in drift:
-        saved = backup(path)
-        write_text(path, new_text)
-        log(f"rewrote {path} (backup: {saved.name})", log_file)
+    apply_plans(drift, log_file)
     log("applied; restart the DSH host so the model picker reloads the new ids", log_file)
     return 20
 
@@ -653,7 +746,7 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except SyncError as exc:
+    except (SyncError, OSError, ValueError, TypeError, AttributeError) as exc:
         try:
             print(f"error: {exc}", file=sys.stderr)
         except (AttributeError, OSError, ValueError):
