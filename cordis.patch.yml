@@ -1,9 +1,10 @@
-# 只在 DSH 真的使用 um-genai provider 時喚醒本機 UM 代理（127.0.0.1:8788），
-# 最後一次使用後閒置 15 分鐘就把它關掉。
+# 讓本機 UM 代理（127.0.0.1:8788）長期可用。
+# alwaysOn: true → 宿主啟動時主動喚醒、永不閒置關閉、宿主關閉也不會把代理一起帶走；
+# 代理真的掛掉時由看門狗 scripts/um-renew.py（排程每 5 分鐘）補位。
 # 代理的啟動/停止邏輯在 lib/proxy.js；事件接線在 lib/index.js。
 - insert:
     - id: dsh-um-proxy-ondemand
       name: dsh-um-proxy-ondemand
       config:
         port: 8788
-        idleMinutes: 15
+        alwaysOn: true

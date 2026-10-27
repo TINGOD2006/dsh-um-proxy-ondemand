@@ -93,11 +93,31 @@ node test/idle_timeout.mjs
       name: dsh-um-proxy-ondemand
       config:
         port: 8788
-        idleMinutes: 15
+        alwaysOn: true
 ```
 
-可用欄位：`port`、`idleMinutes`、`idleSeconds`（測試用短週期覆寫）、`provider`
+可用欄位：`port`、`alwaysOn`、`idleMinutes`、`idleSeconds`（測試用短週期覆寫）、`provider`
 （預設比對 `um-genai`）、`python`、`script`、`logFile`、`stateFile`、`startupTimeoutMs`。
+
+### 常駐模式（`alwaysOn: true`，目前預設）
+
+按需喚醒省資源，但代價是「DSH 重啟或關掉之後，8788 沒人聽」——使用者會遇到 401／連不上，
+而且外掛自己的 token 看門狗也只在代理活著時才跑。要它長期有效就開常駐：
+
+| 行為 | 按需（`idleMinutes: 15`） | 常駐（`alwaysOn: true`） |
+| --- | --- | --- |
+| 宿主啟動 | 等第一個 um-genai 請求才喚醒 | **立刻喚醒**（`ensureProxy`），DSH 一開就好 |
+| 閒置 | 15 分鐘後關掉 | **不關**（`idleTimerArmed` 永遠 `false`） |
+| 宿主關閉 | 把代理一起關掉 | **不關**，留下來繼續服務 |
+| 代理真的掛掉 | 沒人補 | 排程 `\UMGenAIProxy-Renew` 每 5 分鐘跑 `um-renew.py`，順便 `ensure_proxy()` 補位 |
+| 補位延遲 | — | 最多 5 分鐘（可用 `schtasks /Change /TN "\UMGenAIProxy-Renew"` 調整） |
+
+`idleMinutes: 0` 也等於常駐（比較好記）。狀態端點會回報 `alwaysOn: true`，
+`idleTimerArmed` 應為 `false`——如果還是 `true`，代表宿主跑的是舊版外掛，重啟 DSH 即可。
+
+> 常駐模式不會阻止你手動 `stop`；但下次看門狗（5 分鐘內）會再把它叫起來。
+> 要暫時停用，先把排程 Disable：`schtasks /Change /TN "\UMGenAIProxy-Renew" /DISABLE`。
+
 
 ## 怎麼確認它在運作
 
@@ -180,8 +200,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix
 
 | 情況 | 行為 |
 | --- | --- |
-| JWT 還有效、距到期 > 20 分鐘，**且 gateway 實測接受** | 讀一次 JWT ＋ 一次 `GET /api/models`，靜默 `exit 0`（實測 **315 ms**，不開任何視窗） |
-| 距到期 ≤ 20 分鐘、已過期、或 JWT 讀不到 | 執行 `python um_opencode_setup.py login --timeout 120`，把過程寫進 log |
+| **8788 沒人聽（DSH 關掉／重啟中／代理掛掉）** | **先把代理叫起來**（`ensure_proxy()`：`serve --port 8788`，最多等 30 秒），log `proxy was down; started it (pid ...)`；失敗也只記一行，不影響續期 |
+| JWT 還有效、距到期 > 20 分鐘、**簽發未滿 25 分鐘**，**且 gateway 實測接受** | 讀一次 JWT ＋ 一次 `GET /api/models`，靜默 `exit 0`（實測 **315 ms**，不開任何視窗） |
+| 距到期 ≤ 20 分鐘、已過期、**簽發超過 25 分鐘**、或 JWT 讀不到 | 執行 `python um_opencode_setup.py login --timeout 120`，把過程寫進 log |
 | **JWT 沒到期但 gateway 回 401／403** | 一樣當作需要續期（見下節：JWT `exp` 不是有效性證明） |
 | 續期後 gateway 仍拒絕新 token | 記成失敗（`token rejected by the gateway right after login`）並進入退避，不再假裝成功 |
 | 私有 profile 被殘留 Chrome 佔住、開不出 debug port | 自動 `taskkill` 那個殘留視窗再開新的（`closing stale Chrome holding the private profile: pid ...`） |
@@ -458,19 +479,26 @@ python C:\Python314\python.exe -B C:\Users\TINGOD\.um-opencode\um_opencode_setup
 
 兩次事故（10-25 13:07 發、14:08 起 401；10-27 16:52 發、約 17:52 起 401）都是同一個形狀：
 JWT 的 `exp` 還有 8 小時以上，gateway 卻已經不認這個 session。也就是說 **`exp` 是上限，不是保證**，
-伺服端會在簽發後約一小時內結束 session。
+伺服端會在簽發後約 30–60 分鐘內結束 session（10-27 晚間又觀測到 17:57 簽發、18:27 就被拒，只撐了 30 分鐘）。
 
-- `um-renew.py` 改為「按年齡續期」：`MAX_TOKEN_AGE_SECONDS = 50 分鐘`，超過就主動換，不等 `exp` 逼近。
+- `um-renew.py` 改為「按年齡續期」：`MAX_TOKEN_AGE_SECONDS = 25 分鐘`（原本 50 分鐘，30 分鐘那次事故後收緊），
+  超過就主動換，不等 `exp` 逼近；加上每 5 分鐘一次的 gateway 探測，最壞情況的 401 窗口約 5 分鐘。
 - gateway 探測失敗會重試一次（15 秒逾時 × 2）：10-27 那次就是一顆 15 秒逾時把續期跳過去了，
   下一秒請求就吃到 401。
-- 若兩次探測都連不上，但 token 已超過 40 分鐘，仍照樣續期（寧可多換一次，也不要讓使用者看到 401）。
+- 若兩次探測都連不上，但 token 已超過 15 分鐘，仍照樣續期（寧可多換一次，也不要讓使用者看到 401）。
 - `open_login_window()` 的「等除錯埠」由 8 秒放寬到 20 秒，`auto_login()` 找不到視窗時最多重試 3 次並各等 1 秒：
   17:55 那次代理端記的是 `auto-login skipped: no login window with a debug port is open.`，
   其實只是 Chrome 還沒把埠開出來。
 - 續期後仍會用 gateway 驗一次；被拒就記 `token rejected by the gateway right after login` 並退避，不寫假的成功。
+- 同一輪把「代理本身」也納入看門狗：`ensure_proxy()` 在每次執行開頭檢查 `http://127.0.0.1:8788/health`，
+  沒人聽就自己 `serve` 起來並等 `/health`（最多 30 秒）。搭配外掛的常駐模式，DSH 關著或重啟中也不會出現
+  「8788 沒人聽」的空窗（實測：`taskkill` 掉代理後跑一次看門狗 → `proxy was down; started it (pid 6920)`）。
 
-驗證：`um-renew.py --status` 顯示 `issued at` 與新的續期條件；`--probe` 回 `gateway: ok (HTTP 200)`；
+驗證：`um-renew.py --status` 顯示 `issued at` 與新的續期條件（`older than 25 min`）；`--probe` 回 `gateway: ok (HTTP 200)`；
 token 有效時排程本體 372 ms 靜默結束；`um-health.py` 的 `gateway accepts token` 為 HTTP 200。
+
+`alwaysOn` 的行為由 `node test/always_on.mjs` 驗證（9 項：啟動即喚醒、閒置不關、狀態端點 `alwaysOn`／
+`idleTimerArmed: false`、卸載不帶走代理）。
 
 可重複執行的隔離回歸測試：
 

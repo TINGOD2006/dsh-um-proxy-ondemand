@@ -65,13 +65,19 @@ PROBE_TIMEOUT = 15.0
 
 LEAD_SECONDS = 20 * 60  # renew this long before the JWT expires
 # The gateway stops honouring a session token long before the JWT's exp says so:
-# 2026-10-25 13:07 issued -> rejected from 14:08, 2026-10-27 16:52 issued ->
-# rejected by 17:52, both with a ~9 hour exp claim. Refresh on age, not on exp,
-# so a server-side cutoff never turns into a 401 the user has to notice.
-MAX_TOKEN_AGE_SECONDS = 50 * 60
+# 2026-10-25 13:07 issued -> rejected from 14:08 (61 min), 2026-10-27 16:52 ->
+# rejected by 17:52 (60 min), 2026-10-27 17:57 -> rejected by 18:27 (30 min),
+# all with a ~9 hour exp claim. Refresh on age, not on exp, so a server-side
+# cutoff never turns into a 401 the user has to notice. 25 minutes keeps the
+# session fresh even for the shortest cutoff seen so far, and the gateway probe
+# below still catches any shorter one.
+MAX_TOKEN_AGE_SECONDS = 25 * 60
 # A probe that only times out (gateway hiccup) must not postpone a refresh that
 # the token's age already justifies, so age wins once the retries are spent.
-PROBE_ERROR_AGE_SECONDS = 40 * 60
+PROBE_ERROR_AGE_SECONDS = 15 * 60
+PROXY_PORT = int(os.environ.get("UM_PROXY_PORT", "8788"))
+PROXY_HEALTH_TIMEOUT = 2.0
+PROXY_START_TIMEOUT = 30.0
 LOGIN_TIMEOUT_SECONDS = 120
 FAIL_BACKOFF_SECONDS = 15 * 60  # do not retry a failed login more often than this
 
@@ -380,6 +386,57 @@ def run_login(timeout: int) -> bool:
     return True
 
 
+def proxy_healthy(port: int = PROXY_PORT, timeout: float = PROXY_HEALTH_TIMEOUT) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout) as response:
+            body = json.loads(response.read(65536).decode("utf-8", "replace") or "{}")
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+    return body.get("service") == "um-opencode-proxy"
+
+
+def ensure_proxy(port: int = PROXY_PORT) -> bool:
+    """Start the local UM proxy when nothing answers on 8788.
+
+    The DSH plugin now runs in always-on mode, but the host can be closed or
+    restarting; without this the user's chat would 401/refuse until DSH happens
+    to wake the proxy again.
+    """
+    if proxy_healthy(port):
+        return True
+    if not SETUP_SCRIPT.exists():
+        log(f"proxy is down and {SETUP_SCRIPT} is missing; cannot start it")
+        return False
+    command = [
+        python_executable(), "-B", str(SETUP_SCRIPT), "serve",
+        "--port", str(port), "--ignore-console-events",
+        "--log-file", str(HOME / "proxy.log"),
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(HOME),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=(
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            ),
+        )
+    except OSError as exc:
+        log(f"proxy is down and could not be started: {type(exc).__name__}: {exc}")
+        return False
+    deadline = time.monotonic() + PROXY_START_TIMEOUT
+    while time.monotonic() < deadline:
+        if proxy_healthy(port):
+            log(f"proxy was down; started it (pid {process.pid})")
+            return True
+        time.sleep(0.5)
+    log(f"proxy was down; started pid {process.pid} but /health stayed silent for {int(PROXY_START_TIMEOUT)}s")
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--status", action="store_true", help="print the token state and exit")
@@ -389,6 +446,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.timeout <= 0 or args.timeout > 600:
         parser.error("--timeout must be between 1 and 600 seconds")
+
+    if not args.status and not args.probe:
+        # Keep 8788 alive even while the DSH host is closed or restarting.
+        ensure_proxy()
 
     now = time.time()
     exp = token_expiry()

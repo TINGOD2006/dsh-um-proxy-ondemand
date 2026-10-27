@@ -14,9 +14,10 @@
     "um:models:apply": "C:\\Python314\\python.exe -B scripts/um-models-sync.py --apply",
     "um:health": "C:\\Python314\\python.exe -B scripts/um-health.py",
     "test:unit": "node test/efficiency_unit.mjs",
+    "test:always-on": "node test/always_on.mjs",
     "test:stability": "node --test test/proxy_stability.test.mjs && node --experimental-test-module-mocks --test test/plugin_stability.test.mjs",
     "test:scripts": "C:\\Python314\\python.exe -B test/scripts_stability.py",
-    "test": "npm run test:unit && npm run test:stability && npm run test:scripts"
+    "test": "npm run test:unit && npm run test:always-on && npm run test:stability && npm run test:scripts"
   },
   "dsh": {
     "bundle": {
