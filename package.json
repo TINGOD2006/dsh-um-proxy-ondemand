@@ -1,11 +1,14 @@
 {
   "name": "dsh-um-proxy-ondemand",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Wake the local UM GenAI proxy (127.0.0.1:8788) only when DSH actually uses the um-genai provider, and stop it after an idle period.",
+  "description": "Wake the local UM GenAI proxy (127.0.0.1:8788) only when DSH actually uses the um-genai provider, stop it after an idle period, and manage it from a DSH settings page.",
   "type": "module",
   "exports": {
-    ".": "./lib/index.js"
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
   },
   "scripts": {
     "um:recover": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/um-recover.ps1",
@@ -16,12 +19,29 @@
     "test:unit": "node test/efficiency_unit.mjs",
     "test:always-on": "node test/always_on.mjs",
     "test:stability": "node --test test/proxy_stability.test.mjs && node --experimental-test-module-mocks --test test/plugin_stability.test.mjs",
+    "test:settings": "node test/settings_api.test.mjs",
     "test:scripts": "C:\\Python314\\python.exe -B -m unittest discover -s test -p \"*stability.py\"",
-    "test": "npm run test:unit && npm run test:always-on && npm run test:stability && npm run test:scripts"
+    "test": "npm run test:unit && npm run test:always-on && npm run test:stability && npm run test:settings && npm run test:scripts"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "react": "^18.3.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
     }
   }
 }

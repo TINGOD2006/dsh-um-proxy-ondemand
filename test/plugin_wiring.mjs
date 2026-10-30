@@ -40,7 +40,10 @@ plugin.apply(ctx, { port: cfg.port, idleMinutes: 15 })
 
 check('插件名正確', plugin.name === 'dsh-um-proxy-ondemand', plugin.name)
 check('註冊了 llm/stream 監聽器', typeof handlers.get('llm/stream') === 'function')
-check('註冊了唯讀狀態端點', routes.length === 1 && routes[0].path === '/um-proxy-ondemand/state.json')
+const statusRoute = routes.find((route) => route.path === '/um-proxy-ondemand/state.json')
+const apiRoute = routes.find((route) => route.path === '/um-proxy-ondemand/api')
+check('註冊了唯讀狀態端點', Boolean(statusRoute) && statusRoute.kind === 'exact')
+check('註冊了設定頁 API 前綴路由', Boolean(apiRoute) && apiRoute.kind === 'prefix')
 
 const streamHandler = handlers.get('llm/stream')
 
@@ -77,7 +80,7 @@ check('經過外掛後代理已啟動且 /health 通過', (await health(cfg.port
 
 // ── C. 狀態端點 ───────────────────────────────────────────────────────────
 let payload = null
-await routes[0].handler({}, { writeHead: () => {}, end: (body) => (payload = JSON.parse(body)) })
+await statusRoute.handler({}, { writeHead: () => {}, end: (body) => (payload = JSON.parse(body)) })
 check('狀態端點回報 running=true', payload?.running === true)
 check('狀態端點回報 pid', typeof payload?.pid === 'number', `pid=${payload?.pid}`)
 check('統計：1 次請求、1 次喚醒、1 次冷啟動', payload?.stats?.requests === 1 && payload?.stats?.wakes === 1 && payload?.stats?.coldStarts === 1, JSON.stringify(payload?.stats))
