@@ -46,6 +46,8 @@ import os
 import pathlib
 import subprocess
 import sys
+import socket
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -123,18 +125,31 @@ def token_claims() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def claim_time(name: str) -> float | None:
+    value = token_claims().get(name)
+    if type(value) not in (int, float):
+        return None
+    try:
+        value = float(value)
+        # Restrict to timestamps supported by Windows and meaningful for a JWT.
+        return value if math.isfinite(value) and 0 <= value <= 253402300799 else None
+    except (OverflowError, ValueError):
+        return None
+
+
 def token_expiry() -> float | None:
-    exp = token_claims().get("exp")
-    return float(exp) if type(exp) in (int, float) and math.isfinite(exp) else None
+    return claim_time("exp")
 
 
 def token_issued() -> float | None:
-    iat = token_claims().get("iat")
-    return float(iat) if type(iat) in (int, float) and math.isfinite(iat) else None
+    return claim_time("iat")
 
 
 def local_time(ts: float) -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except (ValueError, OSError, OverflowError):
+        return "unrepresentable timestamp"
 
 
 def describe(exp: float | None, now: float) -> str:
@@ -248,7 +263,27 @@ def in_backoff(now: float) -> float:
         failed_at = float(BACKOFF_FILE.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return 0.0
+    if not math.isfinite(failed_at) or failed_at > now:
+        return 0.0
     return max(0.0, FAIL_BACKOFF_SECONDS - (now - failed_at))
+
+
+def record_failure(now: float) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=HOME,
+                                         prefix="renew-backoff-", delete=False) as handle:
+            temporary = pathlib.Path(handle.name)
+            handle.write(str(now))
+        os.replace(temporary, BACKOFF_FILE)
+    except OSError:
+        log("could not persist renewal backoff")
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def powershell(script: str, timeout: float = 30.0) -> str:
@@ -345,6 +380,24 @@ def close_stale_login_window() -> None:
     # The next login replaces its debug-port file; leave it alone on kill failure.
 
 
+def login_process(command: list[str], timeout: int):
+    """Bound parent memory and reap the login process on timeout."""
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            returncode = process.wait(timeout=timeout + 90)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            raise
+        output.seek(0, os.SEEK_END)
+        output.seek(max(0, output.tell() - 16384))
+        return subprocess.CompletedProcess(command, returncode, stdout=output.read())
+
+
 def run_login(timeout: int) -> bool:
     if not SETUP_SCRIPT.exists():
         log(f"cannot renew: {SETUP_SCRIPT} is missing")
@@ -352,17 +405,9 @@ def run_login(timeout: int) -> bool:
     if not debug_port_alive():
         close_stale_login_window()
     command = [python_executable(), "-B", str(SETUP_SCRIPT), "login", "--timeout", str(timeout)]
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     log("token is due: running the auto-login script")
     try:
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            creationflags=creation_flags,
-            timeout=timeout + 90,
-            check=False,
-        )
+        completed = login_process(command, timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         log(f"auto-login could not run: {type(exc).__name__}: {exc}")
         return False
@@ -389,10 +434,18 @@ def run_login(timeout: int) -> bool:
 def proxy_healthy(port: int = PROXY_PORT, timeout: float = PROXY_HEALTH_TIMEOUT) -> bool:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout) as response:
-            body = json.loads(response.read(65536).decode("utf-8", "replace") or "{}")
+            if response.status != 200:
+                return False
+            raw = response.read(65537)
+            if len(raw) > 65536:
+                return False
+            body = json.loads(raw.decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        return False
     except (urllib.error.URLError, OSError, ValueError):
         return False
-    return body.get("service") == "um-opencode-proxy"
+    return isinstance(body, dict) and body.get("service") == "um-opencode-proxy"
 
 
 def ensure_proxy(port: int = PROXY_PORT) -> bool:
@@ -404,6 +457,16 @@ def ensure_proxy(port: int = PROXY_PORT) -> bool:
     """
     if proxy_healthy(port):
         return True
+    # A failed /health does not mean the port is free. Preserve its listener.
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            log(f"port {port} is occupied but unhealthy; refusing to start a duplicate")
+            return False
+    except ConnectionRefusedError:
+        pass
+    except OSError:
+        log(f"cannot establish whether port {port} is free; deferring startup")
+        return False
     if not SETUP_SCRIPT.exists():
         log(f"proxy is down and {SETUP_SCRIPT} is missing; cannot start it")
         return False
@@ -429,10 +492,19 @@ def ensure_proxy(port: int = PROXY_PORT) -> bool:
         return False
     deadline = time.monotonic() + PROXY_START_TIMEOUT
     while time.monotonic() < deadline:
-        if proxy_healthy(port):
+        if process.poll() is not None:
+            log(f"proxy exited before becoming healthy (code {process.returncode})")
+            return False
+        if proxy_healthy(port, timeout=max(0.001, min(PROXY_HEALTH_TIMEOUT, deadline - time.monotonic()))):
             log(f"proxy was down; started it (pid {process.pid})")
             return True
-        time.sleep(0.5)
+        time.sleep(max(0, min(0.5, deadline - time.monotonic())))
+    if process.poll() is None:
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            log("failed to reap the proxy startup process")
     log(f"proxy was down; started pid {process.pid} but /health stayed silent for {int(PROXY_START_TIMEOUT)}s")
     return False
 
@@ -446,10 +518,6 @@ def main() -> int:
     args = parser.parse_args()
     if args.timeout <= 0 or args.timeout > 600:
         parser.error("--timeout must be between 1 and 600 seconds")
-
-    if not args.status and not args.probe:
-        # Keep 8788 alive even while the DSH host is closed or restarting.
-        ensure_proxy()
 
     now = time.time()
     exp = token_expiry()
@@ -472,9 +540,21 @@ def main() -> int:
         print(f"gateway    : {probe_state} ({detail})")
         return 0 if probe_state == "ok" else (2 if probe_state == "rejected" else 3)
 
+    if not acquire_lock(time.time()):
+        log("another watchdog cycle is active or its lock is unavailable")
+        return 1
+    try:
+        return watchdog_cycle(args)
+    finally:
+        release_lock()
+
+
+def watchdog_cycle(args) -> int:
+    proxy_ok = ensure_proxy()
+    now = time.time()
+    exp, issued = token_expiry(), token_issued()
+    state = describe(exp, now)
     renewal_due = args.force or needs_renewal(exp, now, issued)
-    if not renewal_due and issued is not None and now - issued >= MAX_TOKEN_AGE_SECONDS:
-        renewal_due = True
     probe_state, probe_detail = ("unknown", "not probed")
     if not renewal_due:
         # exp says "fine", but the gateway can disagree. Trust the gateway.
@@ -496,42 +576,28 @@ def main() -> int:
                 log(f"gateway probe unavailable ({probe_detail}); leaving token unchanged")
                 return 3
         else:
-            return 0
+            return 0 if proxy_ok else 2
 
     wait = 0.0 if args.force else in_backoff(now)
     if wait > 0:
         log(f"token is due ({state}) but the last attempt failed; retrying in {int(wait // 60)} min")
         return 1
 
-    if not acquire_lock(now):
-        log(f"token is due ({state}) but another renewal is already running")
-        return 1
-    try:
-        # Another renewal may have completed between the probe and this lock.
-        if not args.force and not needs_renewal(token_expiry(), time.time(), token_issued()):
-            current_state, _ = gateway_check(read_token())
-            if current_state == "ok":
-                return 0
-        if probe_state == "unknown":
-            probe_state, probe_detail = gateway_check(read_token())
-        log(f"token is due: {state}; gateway {probe_state} ({probe_detail})")
-        ok = run_login(args.timeout)
-        if ok:
-            fresh = token_expiry()
-            log(f"auto-login finished: {describe(fresh, time.time())}")
-            try:
-                BACKOFF_FILE.unlink()
-            except OSError:
-                pass
-            return 0
-        log("auto-login did not produce a usable token; backing off before the next attempt")
+    if probe_state == "unknown":
+        probe_state, probe_detail = gateway_check(read_token())
+    log(f"token is due: {state}; gateway {probe_state} ({probe_detail})")
+    ok = run_login(args.timeout)
+    if ok:
+        fresh = token_expiry()
+        log(f"auto-login finished: {describe(fresh, time.time())}")
         try:
-            BACKOFF_FILE.write_text(str(time.time()), encoding="utf-8")
+            BACKOFF_FILE.unlink()
         except OSError:
             pass
-        return 1
-    finally:
-        release_lock()
+        return 0 if proxy_ok else 2
+    log("auto-login did not produce a usable token; backing off before the next attempt")
+    record_failure(time.time())
+    return 1
 
 
 if __name__ == "__main__":

@@ -10,8 +10,24 @@
 
 import { cfgOf, health, stopProxy } from '../lib/proxy.js'
 import * as plugin from '../lib/index.js'
+import http from 'node:http'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const cfg = cfgOf({ port: 8798 })
+const probe = http.createServer()
+await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve))
+const port = probe.address().port
+await new Promise(resolve => probe.close(resolve))
+const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-always-on-'))
+const cfg = cfgOf({
+  port,
+  python: process.env.UM_TEST_PYTHON || 'C:\\Python314\\python.exe',
+  script: fileURLToPath(new URL('./fixtures/proxy.py', import.meta.url)),
+  stateFile: path.join(temporary, 'state.json'),
+  logFile: path.join(temporary, 'proxy.log'),
+})
 let failures = 0
 const check = (label, ok, detail = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? '  — ' + detail : ''}`)
@@ -37,7 +53,7 @@ const ctx = {
 await stopProxy(cfg) // 起點：測試埠上沒有代理
 check('起點：代理是關閉的', (await health(cfg.port)) === false)
 
-plugin.apply(ctx, { port: cfg.port, alwaysOn: true, idleSeconds: 1 })
+plugin.apply(ctx, { ...cfg, alwaysOn: true, idleSeconds: 1 })
 
 // A. startup 是非阻塞的；等它把代理叫起來。
 let warmed = false
@@ -69,6 +85,8 @@ check('宿主卸載後代理仍在跑（交給看門狗接手）', (await health
 // 收尾：測試代理不留痕跡。
 await stopProxy(cfg)
 check('收尾：測試代理已關閉', (await health(cfg.port)) === false)
+if (!temporary.startsWith(path.join(os.tmpdir(), 'dsh-always-on-'))) throw new Error('invalid cleanup path')
+fs.rmSync(temporary, { recursive: true, force: true })
 
 console.log(failures === 0 ? '\n==== ALL PASS ====' : `\n==== ${failures} FAILURE(S) ====`)
 process.exit(failures === 0 ? 0 : 1)

@@ -31,6 +31,17 @@ def jwt(payload):
 
 
 class Stability(unittest.TestCase):
+    def setUp(self):
+        self.proxy_patch = patch.object(renew, "ensure_proxy", return_value=True)
+        self.proxy_patch.start()
+        self.addCleanup(self.proxy_patch.stop)
+        # main() tests must never acquire the user's real lock or read credentials.
+        self.lock_patch = patch.object(renew, "acquire_lock", return_value=True)
+        self.unlock_patch = patch.object(renew, "release_lock")
+        if self._testMethodName == "test_network_failure_is_reported_without_renewal":
+            self.lock_patch.start(); self.unlock_patch.start()
+            self.addCleanup(self.lock_patch.stop); self.addCleanup(self.unlock_patch.stop)
+
     def test_jwt_malformed_payloads_do_not_crash(self):
         for payload in [[], None, "oops", {"exp": True}, {"exp": float("inf")}, {"exp": float("nan")}]:
             self.assertIsNone(health.jwt_expiry(jwt(payload)))
@@ -87,7 +98,7 @@ class Stability(unittest.TestCase):
 
     def test_unconfirmed_fresh_token_is_not_success(self):
         completed = subprocess.CompletedProcess([], 0, stdout=b"logged in")
-        with patch.object(Path, "exists", return_value=True), patch.object(renew, "debug_port_alive", return_value=True), patch.object(renew.subprocess, "run", return_value=completed), patch.object(renew, "read_token", return_value="fake"), patch.object(renew, "gateway_check", return_value=("error", "offline")), patch.object(renew, "log"):
+        with patch.object(Path, "exists", return_value=True), patch.object(renew, "debug_port_alive", return_value=True), patch.object(renew, "login_process", return_value=completed), patch.object(renew, "read_token", return_value="fake"), patch.object(renew, "gateway_check", return_value=("error", "offline")), patch.object(renew, "log"):
             self.assertFalse(renew.run_login(1))
 
     def test_network_failure_is_reported_without_renewal(self):
@@ -100,7 +111,7 @@ class Stability(unittest.TestCase):
             response = io.BytesIO(raw)
             response.status = 200
             with patch.object(renew.urllib.request, "urlopen", return_value=response):
-                self.assertEqual(renew.gateway_check("fake")[0], expected)
+                self.assertEqual(renew.gateway_check("fake", attempts=1)[0], expected)
 
     def test_health_http_503_is_failure_not_sleep(self):
         checks = health.Checks()
