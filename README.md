@@ -68,7 +68,8 @@ health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死�
 | `test/coldstart.mjs` | 冷啟動計時，供無視窗驗證使用。 |
 | `test/efficiency_unit.mjs` | 純單元測試（不寫檔、不起代理）：single-flight、輪詢排程、狀態檔節流、`healthDetail` 判定。 |
 | `scripts/um-recover.ps1` | 反代自救腳本：診斷 401（上游 UM token 過期 vs `local-api-key` 不對），可 `-Fix` 自動重新登入。 |
-| `scripts/um-renew.py` | 續期看門狗（獨立於代理）：每 5 分鐘檢查 JWT `exp` **和 gateway 是否真的接受 token**，需要時自動跑 `login`、清掉殘留的登入 Chrome，並在續期後實測新 token。 |
+| `scripts/um-renew.py` | 續期看門狗（獨立於代理）：每 5 分鐘檢查 JWT `exp`、**距上次成功續期的時間**和 gateway 是否真的接受 token，需要時自動跑 `login`、清掉殘留的登入 Chrome、先把登入瀏覽器放到隱藏桌面，並在續期後實測新 token。 |
+| `scripts/um_hidden_window.py` | 把登入用的 Chrome 開在私有的 Win32 桌面上（使用者看不到，但渲染與 DevTools 照常），並把它的 debug 埠發佈到 `browser-debug-port`；可 `--status`／`--ensure`／`--close`／`--probe`。 |
 
 執行測試（前三支會實際啟停 8788 代理）：
 
@@ -201,11 +202,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix
 | 情況 | 行為 |
 | --- | --- |
 | **8788 沒人聽（DSH 關掉／重啟中／代理掛掉）** | **先把代理叫起來**（`ensure_proxy()`：`serve --port 8788`，最多等 30 秒），log `proxy was down; started it (pid ...)`；失敗也只記一行，不影響續期 |
-| JWT 還有效、距到期 > 20 分鐘、**簽發未滿 25 分鐘**，**且 gateway 實測接受** | 讀一次 JWT ＋ 一次 `GET /api/models`，靜默 `exit 0`（實測 **315 ms**，不開任何視窗） |
-| 距到期 ≤ 20 分鐘、已過期、**簽發超過 25 分鐘**、或 JWT 讀不到 | 執行 `python um_opencode_setup.py login --timeout 120`，把過程寫進 log |
+| JWT 還有效、距到期 > 20 分鐘、**距上次成功續期未滿 25 分鐘**，**且 gateway 實測接受** | 讀一次 JWT ＋ 一次 `GET /api/models`，靜默 `exit 0`（實測 **315 ms**，不開任何視窗） |
+| 距到期 ≤ 20 分鐘、已過期、**距上次成功續期超過 25 分鐘**、或 JWT 讀不到 | 執行 `python um_opencode_setup.py login --timeout 120`，把過程寫進 log |
 | **JWT 沒到期但 gateway 回 401／403** | 一樣當作需要續期（見下節：JWT `exp` 不是有效性證明） |
 | 續期後 gateway 仍拒絕新 token | 記成失敗（`token rejected by the gateway right after login`）並進入退避，不再假裝成功 |
 | 私有 profile 被殘留 Chrome 佔住、開不出 debug port | 自動 `taskkill` 那個殘留視窗再開新的（`closing stale Chrome holding the private profile: pid ...`） |
+| 需要登入（token 到期、或 gateway 拒收） | 先把登入瀏覽器開在**隱藏桌面**上（`um_hidden_window.py`），登入腳本直接接管那個瀏覽器：不彈窗。詳見「隱藏桌面登入」 |
+| 隱藏桌面那次登入沒完成（Duo 沒人按、密碼變了） | 關掉隱藏瀏覽器，改用一般可見視窗重試**一次**；10 分鐘內不再彈（記錄在 `renew-watchdog.visible-prompt`） |
 | 續期失敗 | 15 分鐘內不重試（避免每 5 分鐘都開一次登入窗），之後再試 |
 | 同時有另一個在看門狗在跑 | 用 `renew-watchdog.lock` 互斥，直接跳過 |
 
@@ -226,8 +229,57 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix
 the private login profile and exposes no debug port`／`auto-login skipped: no login window with a debug port is open`）。
 看門狗現在會在續期前自動清掉這種殘留視窗。
 
+### 續期時鐘：按上次成功續期計時，不看 JWT `iat`
+
+同一份 `browser-profile` 重新登入，gateway 會把**同一顆 session token** 發回來，`iat` 因此不會前進。
+「簽發超過 25 分鐘就續期」這條規則一旦真的重登成功，`iat` 還停在幾小時前，條件永遠成立：看門狗每
+5 分鐘重登一次（隱藏桌面下則是每 5 分鐘白跑一次登入）。
+
+現在時鐘換成**上次續期真的成功**的時刻：`renew-watchdog.last-success`，只有 `attempt_login()` 被
+gateway 確認之後才寫入；檔案不存在就回退到 token 檔本身的 mtime，所以舊機器升級上來也不會誤判。
+`--status` 兩個時間都印出來：
+
+```text
+token state: valid until 2026-11-03 07:59:32 (539 min left)
+issued at  : 2026-11-02 22:59:32 (0 min ago, not the renewal clock: a re-login hands back the same session token)
+renewed at : 2026-11-02 22:58:08 (2 min ago)
+renew when : expired, less than 20 min left, 25 min after the last renewal, or the gateway rejects it
+login      : hidden desktop (UM_HIDDEN_LOGIN)
+```
+
+`needs_renewal(exp, now, renewed_at)` 的順序不變：`exp` 剩下不到 20 分鐘就續期，其餘看距上次成功
+續期是否已滿 25 分鐘。gateway 探測仍是最終裁判：`exp` 說沒事、gateway 卻回 401／403 一樣續期。
+
+### 隱藏桌面登入：續期不再彈窗
+
+登入腳本原本每次都要在使用者螢幕上開一個 Chrome。Windows 上一個視窗可以建立在沒人看的桌面上：
+`CreateDesktopW` 造一個私有桌面、`STARTUPINFO.lpDesktop` 讓子行程在那裡開視窗——視窗是真的
+（Chrome 照常渲染、跑 JS、DevTools 照常在 localhost 接命令），只是永遠不出現在你的螢幕上。
+
+`scripts/um_hidden_window.py` 只負責這一件事：把 Chrome 放到隱藏桌面，並把它的 debug 埠寫進
+`~\.um-opencode\browser-debug-port`。登入腳本看到已經有可用的 debug 埠就直接接管那個瀏覽器
+（`open_login_window()` 回 `None`、`auto_login()` 直接 attach），不會再開第二個視窗；代理自己的
+401 補救路徑走的也是同一個埠，所以一樣不彈窗。
+
+什麼時候還是會彈：隱藏桌面那次登入沒完成。最常見是 Duo 推送到手機但沒人按，或密碼／MFA 狀態變了
+——只有人能處理，而且從腳本這邊分不出是哪一種。於是看門狗會關掉隱藏瀏覽器，改用一般可見視窗重試
+**一次**，並記下 `renew-watchdog.visible-prompt`：`VISIBLE_PROMPT_COOLDOWN = 600` 秒內不再彈第二次，
+避免變成每 5 分鐘騷擾一次。
+
+| 指令 | 作用 |
+| --- | --- |
+| `python -B scripts/um_hidden_window.py --status` | 隱藏瀏覽器還活著嗎（JSON：`ok`／`port`／`pid`／`browser`／`desktop`） |
+| `python -B scripts/um_hidden_window.py --ensure` | 需要時啟動一個；已在跑就沿用（`reused: true`） |
+| `python -B scripts/um_hidden_window.py --close` | 關掉它，清掉埠檔與 PID 檔 |
+| `python -B scripts/um_hidden_window.py --probe` | 自我測試：開起來、確認 DevTools 有回應、再收乾淨 |
+
+`UM_HIDDEN_LOGIN=0`（或 `false`／`no`／`off`）可關掉這一層，回到「直接開可見視窗」的舊行為；
+`--status` 的 `login` 那行會顯示目前是 `hidden desktop` 還是 `visible window`。隱藏桌面只是把視窗
+移出你的螢幕，沒有繞過任何驗證：該按的 Duo 核准還是要按。
+
 檔案位置（都在 `C:\Users\TINGOD\.um-opencode\`）：`renew-watchdog.log`（每次判斷與結果）、
-`renew-watchdog.lock`、`renew-watchdog.last-fail`。
+`renew-watchdog.lock`、`renew-watchdog.last-fail`、`renew-watchdog.last-success`（上次續期成功的時刻）、
+`renew-watchdog.visible-prompt`（上次彈出可見視窗的時刻）、`hidden-window.pid`、`browser-debug-port`。
 
 ```powershell
 # 只看狀態，不動任何東西
@@ -523,3 +575,24 @@ npm test
 - `npm test` 自動收集 Python 穩定性測試。所有測試中的保活、gateway 與登入均隔離或 mock，不使用真實登入憑證。
 
 排程下一次執行會自動載入新的 Python 腳本。本輪未觸發真實續期或 gateway token 探測；需要 Duo 核准時仍須人工完成。
+
+## 隱藏桌面登入與續期時鐘（2026-11-02）
+
+這一輪不改變「按需喚醒 ＋ 25 分鐘年齡續期」的策略，只修看門狗自己製造的兩個問題：
+
+- **登入不再彈窗**：新增 `scripts/um_hidden_window.py`，把登入 Chrome 放到私有 Win32 桌面
+  （`CreateDesktopW` ＋ `STARTUPINFO.lpDesktop`，桌面名 `um-login-hidden`），並把 debug 埠發佈到
+  `~\.um-opencode\browser-debug-port`。`open_login_window()` 見到可用埠就不再開新視窗、`auto_login()`
+  直接 attach，代理自己的 401 補救路徑同樣受益。只有隱藏桌面那次登入失敗（Duo 沒人按、憑證變了）
+  才退回可見視窗，且 10 分鐘內只彈一次（`renew-watchdog.visible-prompt`）。`UM_HIDDEN_LOGIN=0` 可
+  退回舊行為。
+- **續期時鐘改用成功紀錄**：同一個 session 重登會拿到同一顆 token，JWT `iat` 不會前進；舊的
+  「簽發 25 分鐘就續期」於是每 5 分鐘重登一次。現在改看 `renew-watchdog.last-success`
+  （`attempt_login()` 經 gateway 確認後才寫入；檔案缺失就回退 token 檔 mtime），`--status` 同時印
+  `issued at` 與 `renewed at`。
+
+驗證：`test/hidden_window_stability.py` 12/12（離線，只驗桌面／埠檔／PID 檔邏輯與 `--status`、`--ensure`、
+`--close` 的決策，不開真的 Chrome）；`test/renew_stability.py` 的 `AgeRule`（時鐘來源、`iat` 凍結不重登）
+與 `LoginWindowStability`（先隱藏、失敗才一個可見窗、冷卻期不再彈、沒有隱藏瀏覽器就不重試）6/6。
+`um-renew.py --status` 的實際輸出見「續期時鐘」。本輪沒有觸發真實續期或 Duo 登入；`renew_stability.py`
+其餘 13 支需要在本機沙箱外跑（沙箱下建立暫存目錄會被 ACL 拒絕，失敗與改動前基線一致）。
