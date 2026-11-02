@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 from contextlib import ExitStack
-from scripts_stability import renew, jwt
+from scripts_stability import ROOT, renew, jwt
 
 REAL_ENSURE = renew.ensure_proxy
 
@@ -53,9 +53,18 @@ class RenewalStability(unittest.TestCase):
         self.login.assert_not_called()
 
     def test_age_based_renewal_is_preserved(self):
-        with patch.object(renew, 'token_issued', return_value=time.time()-1600):
+        with patch.object(renew, 'last_renewal_time', return_value=time.time()-1600):
             self.assertEqual(renew.main(), 0)
         self.login.assert_called_once()
+
+    def test_frozen_iat_alone_does_not_trigger_a_login(self):
+        # A re-login for the same session returns the same token, so `iat` never
+        # advances; keying the age rule on it made the watchdog log in (and pop a
+        # window) every five minutes.
+        with patch.object(renew, 'last_renewal_time', return_value=time.time()):
+            self.assertAlmostEqual(renew.token_issued(), time.time(), delta=5)
+            self.assertEqual(renew.main(), 0)
+        self.login.assert_not_called()
 
     def test_failed_login_sets_backoff_and_next_cycle_does_not_login(self):
         self.login.return_value = False
@@ -115,6 +124,89 @@ class RenewalStability(unittest.TestCase):
         with patch.object(renew.subprocess, 'Popen', side_effect=spawn):
             result = renew.login_process(['fake'], 1)
         self.assertEqual(len(result.stdout), 16384)
+
+
+class AgeRule(unittest.TestCase):
+    def test_age_is_measured_from_the_last_renewal(self):
+        now = 1_000_000.0
+        exp = now + 10_000
+        self.assertFalse(renew.needs_renewal(exp, now, now - 60))
+        self.assertTrue(renew.needs_renewal(exp, now, now - renew.MAX_TOKEN_AGE_SECONDS))
+        self.assertFalse(renew.needs_renewal(exp, now, None))
+        self.assertTrue(renew.needs_renewal(now + 600, now, now))
+        self.assertTrue(renew.needs_renewal(None, now, now))
+
+    def test_the_recorded_renewal_becomes_the_clock(self):
+        # A missing record falls back to the stored token's mtime; missing both
+        # means there is no clock to age, not a crash.
+        fixtures = ROOT / 'test' / 'fixtures'
+        stored = fixtures / 'proxy.py'
+        with patch.object(renew, 'LAST_SUCCESS_FILE', fixtures / 'missing-last-success'), \
+                patch.object(renew, 'TOKEN_FILE', stored):
+            self.assertEqual(renew.last_renewal_time(), stored.stat().st_mtime)
+        with patch.object(renew, 'LAST_SUCCESS_FILE', fixtures / 'missing-last-success'), \
+                patch.object(renew, 'TOKEN_FILE', fixtures / 'missing-token'):
+            self.assertIsNone(renew.last_renewal_time())
+
+
+class LoginWindowStability(unittest.TestCase):
+    """run_login prefers the hidden desktop and only then shows a window."""
+
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for name, value in {
+            'SETUP_SCRIPT': Path('C:/nope/um_opencode_setup.py'),
+            'VISIBLE_PROMPT_FILE': Path('C:/nope/visible-prompt'),
+            'LAST_SUCCESS_FILE': Path('C:/nope/last-success'),
+        }.items():
+            self.stack.enter_context(patch.object(renew, name, value))
+        self.stack.enter_context(patch.object(Path, 'exists', return_value=True))
+        self.stack.enter_context(patch.object(renew, 'debug_port_alive', return_value=True))
+        self.stack.enter_context(patch.object(renew, 'log'))
+        self.release = self.stack.enter_context(patch.object(renew, 'release_hidden_login_window'))
+        self.mark = self.stack.enter_context(patch.object(renew, 'mark_visible_prompt'))
+        self.record = self.stack.enter_context(patch.object(renew, 'record_renewal'))
+
+    def attempt(self, results):
+        return self.stack.enter_context(patch.object(renew, 'attempt_login', side_effect=list(results)))
+
+    def hidden(self, ok):
+        return self.stack.enter_context(patch.object(renew, 'hidden_login_report', return_value={'ok': ok}))
+
+    def test_successful_hidden_login_shows_no_window(self):
+        self.hidden(True)
+        attempt = self.attempt([True])
+        self.assertTrue(renew.run_login(5))
+        self.assertEqual(attempt.call_count, 1)
+        self.release.assert_not_called()
+        self.mark.assert_not_called()
+        self.record.assert_called_once()
+
+    def test_failed_hidden_login_shows_one_window_and_retries(self):
+        self.hidden(True)
+        self.stack.enter_context(patch.object(renew, 'visible_prompt_allowed', return_value=True))
+        attempt = self.attempt([False, True])
+        self.assertTrue(renew.run_login(5))
+        self.assertEqual(attempt.call_count, 2)
+        self.release.assert_called_once()
+        self.mark.assert_called_once()
+
+    def test_the_visible_retry_respects_its_cooldown(self):
+        self.hidden(True)
+        self.stack.enter_context(patch.object(renew, 'visible_prompt_allowed', return_value=False))
+        attempt = self.attempt([False])
+        self.assertFalse(renew.run_login(5))
+        self.assertEqual(attempt.call_count, 1)
+        self.release.assert_not_called()
+        self.mark.assert_not_called()
+
+    def test_without_a_hidden_browser_there_is_no_retry(self):
+        self.hidden(False)
+        attempt = self.attempt([False])
+        self.assertFalse(renew.run_login(5))
+        self.assertEqual(attempt.call_count, 1)
+        self.release.assert_not_called()
 
 
 if __name__ == '__main__':

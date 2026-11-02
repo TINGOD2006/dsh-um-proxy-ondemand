@@ -24,6 +24,13 @@ gateway. If a leftover Chrome window owns the private profile without exposing a
 debug port (the failure mode that blocked every renewal on 2026-10-25), the stale
 window is closed first so a new one can open.
 
+The login browser is started on a hidden Win32 desktop first (see
+scripts/um_hidden_window.py), so a renewal never puts a window on the user's
+screen: the auto-login script attaches to that browser instead of opening one of
+its own. When a human really has to finish the sign-in (a Duo push nobody
+approved, a changed password) the hidden browser is closed and the attempt is
+repeated once with a visible window, at most once every ten minutes.
+
 Every decision and every outcome is appended to renew-watchdog.log. When the
 token is still accepted the run costs one file read plus one small GET and exits
 quietly.
@@ -57,9 +64,20 @@ TOKEN_FILE = HOME / "upstream-token"
 SETUP_SCRIPT = HOME / "um_opencode_setup.py"
 BROWSER_PROFILE = HOME / "browser-profile"
 DEBUG_PORT_FILE = HOME / "browser-debug-port"
+HIDDEN_PID_FILE = HOME / "hidden-window.pid"
 LOG_FILE = HOME / "renew-watchdog.log"
 LOCK_FILE = HOME / "renew-watchdog.lock"
 BACKOFF_FILE = HOME / "renew-watchdog.last-fail"
+# When the last renewal actually succeeded. The JWT cannot answer this: a fresh
+# login for the same session hands back the same token, so `iat` never advances.
+LAST_SUCCESS_FILE = HOME / "renew-watchdog.last-success"
+VISIBLE_PROMPT_FILE = HOME / "renew-watchdog.visible-prompt"
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+try:  # the module ships next to this script; a missing copy only loses the hiding
+    import um_hidden_window
+except ImportError:  # pragma: no cover
+    um_hidden_window = None
 
 UPSTREAM_BASE = os.environ.get("UM_UPSTREAM_BASE", "https://chat.genai.um.edu.mo")
 PROBE_PATH = "/api/models"
@@ -72,7 +90,10 @@ LEAD_SECONDS = 20 * 60  # renew this long before the JWT expires
 # all with a ~9 hour exp claim. Refresh on age, not on exp, so a server-side
 # cutoff never turns into a 401 the user has to notice. 25 minutes keeps the
 # session fresh even for the shortest cutoff seen so far, and the gateway probe
-# below still catches any shorter one.
+# below still catches any shorter one. The age is counted from the last renewal
+# that worked, never from the JWT's `iat`: signing in again for the same session
+# returns the same token, so an `iat`-based rule stays true forever (that is what
+# made the watchdog run a login, and pop a window, every five minutes).
 MAX_TOKEN_AGE_SECONDS = 25 * 60
 # A probe that only times out (gateway hiccup) must not postpone a refresh that
 # the token's age already justifies, so age wins once the retries are spent.
@@ -82,6 +103,9 @@ PROXY_HEALTH_TIMEOUT = 2.0
 PROXY_START_TIMEOUT = 30.0
 LOGIN_TIMEOUT_SECONDS = 120
 FAIL_BACKOFF_SECONDS = 15 * 60  # do not retry a failed login more often than this
+# A visible window is the last resort, only when a human has to finish the
+# sign-in, and then no more often than the login script's own prompt cooldown.
+VISIBLE_PROMPT_COOLDOWN = 600.0
 
 
 def log(message: str) -> None:
@@ -207,12 +231,55 @@ def _gateway_check_once(token: str) -> tuple[str, str]:
         return "error", f"{type(exc).__name__}: {exc}"
 
 
-def needs_renewal(exp: float | None, now: float, issued: float | None = None) -> bool:
+def last_renewal_time() -> float | None:
+    """When the stored token was last refreshed by a renewal that worked.
+
+    The JWT's `iat` is the wrong clock here: signing in again for the same
+    session returns the same token, so `iat` never moves and an age rule keyed
+    on it stays true forever (that is what made the watchdog re-login, and pop a
+    window, every five minutes). The stored token's mtime is the fallback so a
+    token captured before this file existed is still aged correctly.
+    """
+    for path in (LAST_SUCCESS_FILE, TOKEN_FILE):
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            continue
+    return None
+
+
+def record_renewal(now: float) -> None:
+    """Remember a successful renewal; flushes the age rule in one write."""
+    if not write_atomic(LAST_SUCCESS_FILE, f"{now}\n"):
+        log("could not record the renewal time")
+
+
+def write_atomic(path: pathlib.Path, body: str) -> bool:
+    temporary = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f"{path.name}-", delete=False) as handle:
+            temporary = pathlib.Path(handle.name)
+            handle.write(body)
+        os.replace(temporary, path)
+        return True
+    except OSError:
+        return False
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def needs_renewal(exp: float | None, now: float, renewed_at: float | None = None) -> bool:
     """True when the token should be replaced before the next request needs it."""
     if exp is None or exp - now <= LEAD_SECONDS:
         return True
     # exp is optimistic: the gateway drops sessions well before that.
-    return issued is not None and now - issued >= MAX_TOKEN_AGE_SECONDS
+    return renewed_at is not None and now - renewed_at >= MAX_TOKEN_AGE_SECONDS
 
 
 _lock_handle = None
@@ -269,21 +336,8 @@ def in_backoff(now: float) -> float:
 
 
 def record_failure(now: float) -> None:
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=HOME,
-                                         prefix="renew-backoff-", delete=False) as handle:
-            temporary = pathlib.Path(handle.name)
-            handle.write(str(now))
-        os.replace(temporary, BACKOFF_FILE)
-    except OSError:
+    if not write_atomic(BACKOFF_FILE, str(now)):
         log("could not persist renewal backoff")
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 def powershell(script: str, timeout: float = 30.0) -> str:
@@ -398,12 +452,74 @@ def login_process(command: list[str], timeout: int):
         return subprocess.CompletedProcess(command, returncode, stdout=output.read())
 
 
-def run_login(timeout: int) -> bool:
-    if not SETUP_SCRIPT.exists():
-        log(f"cannot renew: {SETUP_SCRIPT} is missing")
-        return False
-    if not debug_port_alive():
-        close_stale_login_window()
+def hidden_login_enabled() -> bool:
+    return os.environ.get("UM_HIDDEN_LOGIN", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def hidden_login_report() -> dict:
+    """Put a browser with a debug port on the hidden desktop.
+
+    The auto-login script reuses whatever browser already exposes a debug port
+    (open_login_window() returns None as soon as existing_debug_port() answers,
+    and auto_login() attaches to that browser instead of launching one), so this
+    is all it takes to keep its window off the user's screen - including the
+    window the proxy itself opens when an upstream request comes back 401.
+    """
+    if not hidden_login_enabled():
+        log("hidden login disabled (UM_HIDDEN_LOGIN); the login window will be visible")
+        return {"ok": False, "disabled": True}
+    if um_hidden_window is None:
+        log("hidden login unavailable: scripts/um_hidden_window.py is missing")
+        return {"ok": False, "error": "um_hidden_window is missing"}
+    try:
+        report = um_hidden_window.ensure_hidden_chrome(
+            profile=BROWSER_PROFILE,
+            port_file=DEBUG_PORT_FILE,
+            pid_file=HIDDEN_PID_FILE,
+            echo=log,
+        )
+    except Exception as exc:  # a cosmetic step must never break a renewal
+        log(f"hidden login window unavailable: {type(exc).__name__}: {exc}")
+        return {"ok": False, "error": str(exc)}
+    if report.get("ok"):
+        state = "reused" if report.get("reused") else "started"
+        log(f"login browser {state} on the hidden desktop (port {report.get('port')})")
+    else:
+        log(f"hidden login window unavailable ({report.get('error')}); the window will be visible")
+    return report
+
+
+def release_hidden_login_window() -> None:
+    """Close the hidden browser so the next launch lands on the user's desktop."""
+    if um_hidden_window is None:
+        return
+    try:
+        report = um_hidden_window.stop_hidden_chrome(
+            profile=BROWSER_PROFILE, port_file=DEBUG_PORT_FILE, pid_file=HIDDEN_PID_FILE
+        )
+    except Exception as exc:
+        log(f"could not close the hidden login browser: {type(exc).__name__}: {exc}")
+        return
+    stopped = report.get("stopped") or []
+    if stopped:
+        log(f"closed the hidden login browser (pid {', '.join(map(str, stopped))})")
+
+
+def visible_prompt_allowed(now: float) -> bool:
+    try:
+        last = VISIBLE_PROMPT_FILE.stat().st_mtime
+    except OSError:
+        return True
+    return now - last >= VISIBLE_PROMPT_COOLDOWN
+
+
+def mark_visible_prompt(now: float) -> None:
+    if not write_atomic(VISIBLE_PROMPT_FILE, f"{int(now)}\n"):
+        log("could not record the visible login prompt")
+
+
+def attempt_login(timeout: int) -> bool:
+    """One auto-login run, confirmed by the gateway rather than by the script."""
     command = [python_executable(), "-B", str(SETUP_SCRIPT), "login", "--timeout", str(timeout)]
     log("token is due: running the auto-login script")
     try:
@@ -429,6 +545,35 @@ def run_login(timeout: int) -> bool:
         log(f"cannot confirm the fresh token yet: gateway unreachable ({detail})")
         return False
     return True
+
+
+def run_login(timeout: int) -> bool:
+    if not SETUP_SCRIPT.exists():
+        log(f"cannot renew: {SETUP_SCRIPT} is missing")
+        return False
+    if not debug_port_alive():
+        close_stale_login_window()
+    hidden = bool(hidden_login_report().get("ok"))
+    if attempt_login(timeout):
+        record_renewal(time.time())
+        return True
+    if not hidden:
+        return False
+    # The hidden attempt failed. That is either a real failure or a sign-in only
+    # a human can finish (a Duo push, a changed password), and there is no way to
+    # tell them apart from here - so show the window, but not on every cycle.
+    if not visible_prompt_allowed(time.time()):
+        log("the hidden sign-in needs a human but a window was shown recently; "
+            f"waiting {int(VISIBLE_PROMPT_COOLDOWN // 60)} min before showing another")
+        return False
+    log("the hidden sign-in did not finish; showing the window so a human can complete it")
+    release_hidden_login_window()
+    mark_visible_prompt(time.time())
+    if attempt_login(timeout):
+        record_renewal(time.time())
+        return True
+    return False
+
 
 
 def proxy_healthy(port: int = PROXY_PORT, timeout: float = PROXY_HEALTH_TIMEOUT) -> bool:
@@ -528,9 +673,15 @@ def main() -> int:
         print(f"token file : {TOKEN_FILE}")
         print(f"token state: {state}")
         if issued:
-            print(f"issued at  : {local_time(issued)} ({int((now - issued) // 60)} min ago)")
-        print(f"renew when : expired, less than {LEAD_SECONDS // 60} min left, older than "
-              f"{MAX_TOKEN_AGE_SECONDS // 60} min, or the gateway rejects it")
+            print(f"issued at  : {local_time(issued)} ({int((now - issued) // 60)} min ago, "
+                  "not the renewal clock: a re-login hands back the same session token)")
+        renewed_at = last_renewal_time()
+        if renewed_at is not None:
+            print(f"renewed at : {local_time(renewed_at)} ({int((now - renewed_at) // 60)} min ago)")
+        print(f"renew when : expired, less than {LEAD_SECONDS // 60} min left, "
+              f"{MAX_TOKEN_AGE_SECONDS // 60} min after the last renewal, or the gateway rejects it")
+        print(f"login      : {'hidden desktop' if hidden_login_enabled() else 'visible window'} "
+              "(UM_HIDDEN_LOGIN)")
         print(f"log file   : {LOG_FILE}")
         return 0
 
@@ -552,9 +703,10 @@ def main() -> int:
 def watchdog_cycle(args) -> int:
     proxy_ok = ensure_proxy()
     now = time.time()
-    exp, issued = token_expiry(), token_issued()
+    exp = token_expiry()
+    renewed_at = last_renewal_time()
     state = describe(exp, now)
-    renewal_due = args.force or needs_renewal(exp, now, issued)
+    renewal_due = args.force or needs_renewal(exp, now, renewed_at)
     probe_state, probe_detail = ("unknown", "not probed")
     if not renewal_due:
         # exp says "fine", but the gateway can disagree. Trust the gateway.
@@ -565,11 +717,11 @@ def watchdog_cycle(args) -> int:
 
     if not renewal_due:
         if probe_state == "error":
-            age = int((now - issued) // 60) if issued is not None else None
-            if age is not None and now - issued >= PROBE_ERROR_AGE_SECONDS:
+            age = int((now - renewed_at) // 60) if renewed_at is not None else None
+            if age is not None and now - renewed_at >= PROBE_ERROR_AGE_SECONDS:
                 log(
-                    f"gateway probe unavailable ({probe_detail}) but the token is {age} min old; "
-                    "renewing anyway"
+                    f"gateway probe unavailable ({probe_detail}) but the last renewal was "
+                    f"{age} min ago; renewing anyway"
                 )
                 renewal_due = True
             else:

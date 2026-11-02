@@ -98,7 +98,7 @@ class Stability(unittest.TestCase):
 
     def test_unconfirmed_fresh_token_is_not_success(self):
         completed = subprocess.CompletedProcess([], 0, stdout=b"logged in")
-        with patch.object(Path, "exists", return_value=True), patch.object(renew, "debug_port_alive", return_value=True), patch.object(renew, "login_process", return_value=completed), patch.object(renew, "read_token", return_value="fake"), patch.object(renew, "gateway_check", return_value=("error", "offline")), patch.object(renew, "log"):
+        with patch.object(Path, "exists", return_value=True), patch.object(renew, "debug_port_alive", return_value=True), patch.object(renew, "hidden_login_report", return_value={"ok": False}), patch.object(renew, "login_process", return_value=completed), patch.object(renew, "read_token", return_value="fake"), patch.object(renew, "gateway_check", return_value=("error", "offline")), patch.object(renew, "log"):
             self.assertFalse(renew.run_login(1))
 
     def test_network_failure_is_reported_without_renewal(self):
