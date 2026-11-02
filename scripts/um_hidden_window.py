@@ -262,7 +262,9 @@ def close_desktop(handle: int) -> None:
 
 def launch_on_desktop(executable: pathlib.Path, arguments: list[str], desktop: str) -> tuple[int, int, int]:
     """Start *executable* with its windows on *desktop*; returns (pid, hproc, hthread)."""
-    command = " ".join([f'"{executable}"'] + [f'"{part}"' if " " in part else part for part in arguments])
+    # list2cmdline applies the same quoting rules CreateProcessW expects, so a
+    # profile path with spaces or an embedded quote cannot split into extra argv.
+    command = subprocess.list2cmdline([str(executable)] + arguments)
     startup = _StartupInfo()
     startup.cb = ctypes.sizeof(_StartupInfo)
     startup.lpDesktop = ctypes.c_wchar_p(desktop)
@@ -468,10 +470,17 @@ def ensure_hidden_chrome(
             )
         except OSError as exc:
             report["error"] = f"{type(exc).__name__}: {exc}"
+            close_desktop(desktop)
             return report
+        # The desktop handle has to stay open until the browser is far enough along
+        # to hold its own reference to it. Closing it right after CreateProcessW
+        # destroys the desktop under a process that has not opened it yet, and the
+        # new browser dies with 0xC06D007E before it ever publishes its port -
+        # which is exactly how every hidden login failed until this was fixed.
+        try:
+            version = wait_for_devtools(port, timeout)
         finally:
             close_desktop(desktop)
-        version = wait_for_devtools(port, timeout)
         if version:
             close_handle(process_handle)
             close_handle(thread_handle)

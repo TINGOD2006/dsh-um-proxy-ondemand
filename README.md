@@ -261,6 +261,12 @@ login      : hidden desktop (UM_HIDDEN_LOGIN)
 （`open_login_window()` 回 `None`、`auto_login()` 直接 attach），不會再開第二個視窗；代理自己的
 401 補救路徑走的也是同一個埠，所以一樣不彈窗。
 
+桌面句柄必須活到瀏覽器自己接手為止：`CreateProcessW` 只是把行程丟出去就返回，新行程還沒開啟那個
+桌面，這時 `CloseDesktop` 會把桌面連底下正在啟動的 Chrome 一起拆掉，瀏覽器以 `0xC06D007E`
+（`STATUS_DLL_NOT_FOUND` 形式的崩潰碼）當場結束、永遠不會發佈 debug 埠。外觀上就只是「Chrome
+起不來」，但實際上是我們自己把它的桌面關掉了。所以 `ensure_hidden_chrome()` 把
+`wait_for_devtools()` 包在 `try/finally` 裡，**確認瀏覽器起來之後才** `CloseDesktop`。
+
 什麼時候還是會彈：隱藏桌面那次登入沒完成。最常見是 Duo 推送到手機但沒人按，或密碼／MFA 狀態變了
 ——只有人能處理，而且從腳本這邊分不出是哪一種。於是看門狗會關掉隱藏瀏覽器，改用一般可見視窗重試
 **一次**，並記下 `renew-watchdog.visible-prompt`：`VISIBLE_PROMPT_COOLDOWN = 600` 秒內不再彈第二次，
@@ -591,8 +597,32 @@ npm test
   （`attempt_login()` 經 gateway 確認後才寫入；檔案缺失就回退 token 檔 mtime），`--status` 同時印
   `issued at` 與 `renewed at`。
 
-驗證：`test/hidden_window_stability.py` 12/12（離線，只驗桌面／埠檔／PID 檔邏輯與 `--status`、`--ensure`、
+驗證：`test/hidden_window_stability.py` 15/15（離線，只驗桌面／埠檔／PID 檔邏輯與 `--status`、`--ensure`、
 `--close` 的決策，不開真的 Chrome）；`test/renew_stability.py` 的 `AgeRule`（時鐘來源、`iat` 凍結不重登）
 與 `LoginWindowStability`（先隱藏、失敗才一個可見窗、冷卻期不再彈、沒有隱藏瀏覽器就不重試）6/6。
-`um-renew.py --status` 的實際輸出見「續期時鐘」。本輪沒有觸發真實續期或 Duo 登入；`renew_stability.py`
-其餘 13 支需要在本機沙箱外跑（沙箱下建立暫存目錄會被 ACL 拒絕，失敗與改動前基線一致）。
+`um-renew.py --status` 的實際輸出見「續期時鐘」。本輪沒有觸發真實續期或 Duo 登入。
+
+## 隱藏桌面登入其實一次都沒成功（2026-11-03）
+
+上一輪上線的隱藏桌面，在真實排程上一次都沒成功過：`renew-watchdog.log` 裡每一輪都是
+`hidden login window unavailable (the browser did not publish a DevTools port); the window will be visible`
+（當天 9 次），也就是每次都退回可見視窗——功能寫了但等於沒生效。
+
+- **根因**：`ensure_hidden_chrome()` 在 `CreateProcessW` 之後立刻 `CloseDesktop`（原本寫在 `finally`
+  裡），而新行程此時還沒開啟那個桌面。桌面被銷毀，正在啟動的 Chrome 以 `0xC06D007E` 結束，
+  DevTools 埠自然永遠不會出現。`Popen` 走的是另一條路徑（`STARTUPINFO.lpDesktop` 由 `subprocess`
+  處理、桌面已經由父行程建立），所以手動測試容易看起來是好的。
+- **修法**：把 `wait_for_devtools()` 包進 `try/finally`，確認瀏覽器起來後才關桌面。
+- **順帶**：命令列改用 `subprocess.list2cmdline()` 組（原本是手動加引號，profile 路徑含空格或引號會
+  被切成多個參數）。
+
+實測（同一台機器、同一份 profile）：修好前 3/3 次 `devtools=False`，修好後 3/3 次 `devtools=True`；
+`--ensure` 起好的瀏覽器 20 秒後仍在（`--status` 的 `desktopWindows` 有 `GENAI Chat (Open WebUI)`）；
+`um-renew.py --force` 端到端走完，日誌出現 `login browser started on the hidden desktop (port 5050)`
+且沒有再退回可見視窗。回歸測試 `DesktopLifetime`（3 支）把修法釘住：把 `CloseDesktop` 改回原本位置，
+`test_the_desktop_stays_open_while_the_browser_starts` 立刻失敗並指出
+`desktop was closed before the browser came up`。
+
+驗證：Python 全套 53 支（`hidden_window_stability` 15、`scripts_stability` 19、`renew_stability` 19）在
+非沙箱環境全綠；`node test/efficiency_unit.mjs` 10/10。
+

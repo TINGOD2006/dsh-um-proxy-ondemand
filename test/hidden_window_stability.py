@@ -3,6 +3,7 @@ import importlib.util
 import pathlib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -105,6 +106,62 @@ class Reuse(unittest.TestCase):
     def test_desktop_names_and_urls_are_overridable(self):
         self.assertTrue(window.DESKTOP_NAME)
         self.assertTrue(window.UPSTREAM_BASE.startswith("http"))
+
+
+class DesktopLifetime(unittest.TestCase):
+    """The desktop must outlive the launch, or the browser dies at startup.
+
+    ``CreateProcessW`` returns before the new process has opened the desktop it
+    was told to use. Closing the handle right away destroys that desktop under
+    the browser, which then exits with 0xC06D007E before publishing a DevTools
+    port - every hidden login failed this way, and the failure looked exactly
+    like "Chrome would not start".
+    """
+
+    def setUp(self):
+        self.closed = []
+        self.published = []
+        patcher = mock.patch.multiple(
+            window,
+            open_hidden_desktop=mock.Mock(return_value=77),
+            close_desktop=mock.Mock(side_effect=lambda handle: self.closed.append(handle)),
+            launch_on_desktop=mock.Mock(return_value=(4242, 11, 12)),
+            browser_candidates=mock.Mock(return_value=[("chrome", pathlib.Path("chrome.exe"))]),
+            wait_for_devtools=mock.Mock(side_effect=self._wait),
+            close_handle=mock.Mock(),
+            write_text=mock.Mock(),
+            read_port=mock.Mock(return_value=None),
+            read_pid=mock.Mock(return_value=None),
+            devtools_version=mock.Mock(return_value=None),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _wait(self, port, timeout):
+        self.published.append(list(self.closed))
+        return {"Browser": "Chrome/141"}
+
+    def test_the_desktop_stays_open_while_the_browser_starts(self):
+        report = window.ensure_hidden_chrome(timeout=1.0)
+        self.assertTrue(report["ok"])
+        self.assertEqual(self.published, [[]], "desktop was closed before the browser came up")
+        self.assertEqual(self.closed, [77])
+
+    def test_the_desktop_is_closed_even_when_the_browser_never_answers(self):
+        with mock.patch.object(window, "wait_for_devtools", return_value=None), \
+             mock.patch.object(window, "kill_tree", return_value=True), \
+             mock.patch.object(window, "profile_browser_pids", return_value=[]), \
+             mock.patch.object(window.time, "sleep", return_value=None):
+            report = window.ensure_hidden_chrome(timeout=1.0)
+        self.assertFalse(report["ok"])
+        self.assertEqual(self.closed, [77, 77], "one leaked desktop handle per attempt")
+
+    def test_the_command_line_survives_awkward_paths(self):
+        # list2cmdline is what CreateProcessW expects; naive space-splitting is not.
+        line = window.subprocess.list2cmdline([r"C:\Program Files\Google\chrome.exe",
+                                               r"--user-data-dir=C:\a b\profile"])
+        self.assertEqual(line, r'"C:\Program Files\Google\chrome.exe" '
+                                r'"--user-data-dir=C:\a b\profile"')
 
 
 if __name__ == "__main__":
