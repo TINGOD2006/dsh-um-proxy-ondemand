@@ -406,10 +406,14 @@ def profile_browser_pids(profile: pathlib.Path = BROWSER_PROFILE) -> list[int]:
 def status(port_file: pathlib.Path = DEBUG_PORT_FILE, pid_file: pathlib.Path = PID_FILE) -> dict:
     port = read_port(port_file)
     version = devtools_version(port)
+    alive = should_reuse(port, version)
     report = {
-        "ok": should_reuse(port, version),
+        "ok": alive,
         "port": port,
-        "pid": read_pid(pid_file),
+        # The pid file outlives the browser: the login script closes the browser
+        # and clears only the port file, so a pid read off disk says nothing
+        # about what is running now. Report it only while DevTools still answers.
+        "pid": read_pid(pid_file) if alive else None,
         "browser": (version or {}).get("Browser"),
         "desktop": DESKTOP_NAME,
         "desktopWindows": desktop_windows() if version else [],
@@ -513,13 +517,17 @@ def stop_hidden_chrome(
 ) -> dict:
     stopped: list[int] = []
     pid = read_pid(pid_file)
-    if pid and kill_tree(pid):
-        stopped.append(pid)
     recorded = read_port(port_file)
-    if recorded:
-        for other in profile_browser_pids(profile):
-            if other not in stopped and kill_tree(other):
-                stopped.append(other)
+    # The login script closes the browser but leaves the pid file behind, and
+    # Windows recycles pids. Killing whatever number the file holds would
+    # eventually kill an unrelated process, so only pids whose command line
+    # really names this profile are eligible.
+    owners = profile_browser_pids(profile) if (pid or recorded) else []
+    if pid and pid in owners and kill_tree(pid):
+        stopped.append(pid)
+    for other in owners:
+        if other not in stopped and kill_tree(other):
+            stopped.append(other)
     for path in (port_file, pid_file):
         try:
             path.unlink()

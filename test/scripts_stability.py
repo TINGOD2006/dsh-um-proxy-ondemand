@@ -102,7 +102,11 @@ class Stability(unittest.TestCase):
             self.assertFalse(renew.run_login(1))
 
     def test_network_failure_is_reported_without_renewal(self):
-        with patch.object(sys, "argv", ["um-renew.py"]), patch.object(renew, "token_expiry", return_value=time.time()+10000), patch.object(renew, "token_issued", return_value=None), patch.object(renew, "read_token", return_value="fake"), patch.object(renew, "gateway_check", return_value=("error", "offline")), patch.object(renew, "run_login") as login, patch.object(renew, "log"):
+        # last_renewal_time() reads the real ~/.um-opencode/renew-watchdog.last-success,
+        # so without pinning it this only passes while that file is absent or older
+        # than PROBE_ERROR_AGE_SECONDS: a recent renewal turns the "probe failed"
+        # branch into "renew anyway" and main() returns 0 instead of 3.
+        with patch.object(sys, "argv", ["um-renew.py"]), patch.object(renew, "token_expiry", return_value=time.time()+10000), patch.object(renew, "token_issued", return_value=None), patch.object(renew, "last_renewal_time", return_value=None), patch.object(renew, "read_token", return_value="fake"), patch.object(renew, "gateway_check", return_value=("error", "offline")), patch.object(renew, "run_login") as login, patch.object(renew, "log"):
             self.assertEqual(renew.main(), 3)
             login.assert_not_called()
 

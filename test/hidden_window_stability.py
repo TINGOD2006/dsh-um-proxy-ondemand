@@ -1,6 +1,7 @@
 """Offline regressions for the hidden login browser: no Chrome, no Win32 calls."""
 import importlib.util
 import pathlib
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -162,6 +163,61 @@ class DesktopLifetime(unittest.TestCase):
                                                r"--user-data-dir=C:\a b\profile"])
         self.assertEqual(line, r'"C:\Program Files\Google\chrome.exe" '
                                 r'"--user-data-dir=C:\a b\profile"')
+
+
+class StalePidFile(unittest.TestCase):
+    """A pid file outlives the browser, so it must not be trusted on its own.
+
+    The login script closes the browser with ``Browser.close`` and clears only
+    the port file, leaving ``hidden-window.pid`` behind. Windows recycles pids,
+    so killing that number blindly eventually kills an unrelated process.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = pathlib.Path(self.tmp.name)
+        self.port_file = self.dir / "browser-debug-port"
+        self.pid_file = self.dir / "hidden-window.pid"
+        self.profile = self.dir / "browser-profile"
+        self.killed = []
+
+    def _stop(self, owners):
+        with mock.patch.object(window, "profile_browser_pids", return_value=owners), \
+             mock.patch.object(window, "kill_tree", side_effect=lambda pid: self.killed.append(pid) or True):
+            return window.stop_hidden_chrome(
+                profile=self.profile, port_file=self.port_file, pid_file=self.pid_file
+            )
+
+    def test_a_leftover_pid_is_never_killed_without_matching_its_command_line(self):
+        self.pid_file.write_text("4242\n", encoding="utf-8")
+        report = self._stop(owners=[])
+        self.assertEqual(self.killed, [], "killed a recycled pid nobody proved was ours")
+        self.assertEqual(report["stopped"], [])
+        self.assertFalse(self.pid_file.exists())
+
+    def test_a_pid_that_owns_the_profile_is_still_killed(self):
+        self.pid_file.write_text("4242\n", encoding="utf-8")
+        report = self._stop(owners=[4242])
+        self.assertEqual(self.killed, [4242])
+        self.assertEqual(report["stopped"], [4242])
+
+    def test_status_hides_a_pid_devtools_cannot_confirm(self):
+        self.pid_file.write_text("4242\n", encoding="utf-8")
+        self.port_file.write_text("9333\n", encoding="utf-8")
+        with mock.patch.object(window, "devtools_version", return_value=None):
+            report = window.status(port_file=self.port_file, pid_file=self.pid_file)
+        self.assertFalse(report["ok"])
+        self.assertIsNone(report["pid"], "reported a pid that is not running")
+
+    def test_status_keeps_the_pid_while_devtools_answers(self):
+        self.pid_file.write_text("4242\n", encoding="utf-8")
+        self.port_file.write_text("9333\n", encoding="utf-8")
+        with mock.patch.object(window, "devtools_version", return_value={"Browser": "Chrome/141"}), \
+             mock.patch.object(window, "desktop_windows", return_value=[]):
+            report = window.status(port_file=self.port_file, pid_file=self.pid_file)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["pid"], 4242)
 
 
 if __name__ == "__main__":

@@ -626,3 +626,22 @@ npm test
 驗證：Python 全套 53 支（`hidden_window_stability` 15、`scripts_stability` 19、`renew_stability` 19）在
 非沙箱環境全綠；`node test/efficiency_unit.mjs` 10/10。
 
+## 殘留的 PID 檔會殺錯人（2026-11-03）
+
+登入成功後，`um_opencode_setup.py` 會用 `Browser.close` 關掉那個瀏覽器，但它只清 `browser-debug-port`，
+**`hidden-window.pid` 留了下來**。而 `stop_hidden_chrome()`（`--close` 與續期失敗退回可見窗時都走它）
+原本是「讀到 pid 就 `taskkill /PID`」。Windows 會回收 pid，所以那個號碼遲早會屬於別的行程——屆時
+`--close` 就會隨機殺掉一個跟你無關的程序。
+
+- **修法**：只有當 `profile_browser_pids()` 真的從命令列認出這個 profile 時，該 pid 才具備被殺的資格；
+  沒有任何行程持有該 profile 就只清檔案、不動手。
+- **順帶**：`--status` 現在只在 DevTools 真的回應時才回報 `pid`，否則回 `null`——留著一個死掉的號碼
+  只會誘導人（或腳本）去殺它。
+
+實測：殘留 pid `18132`（已死）下 `--close` → `{"stopped": [], "cleared": [...]}`，什麼都沒殺；
+`--ensure` 起一個真的（pid `5780`）再 `--close` → `{"stopped": [5780]}`，行程確實消失。回歸測試
+`StalePidFile`（4 支）蓋住這兩條路徑與 `--status` 的兩種情況。
+
+驗證：Python 全套 **57 支**全綠（`hidden_window_stability` 19、`scripts_stability` 19、`renew_stability` 19）。
+
+
