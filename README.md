@@ -19,7 +19,7 @@ headless Chrome）。這個外掛把它改成 **按需喚醒 ＋ 閒置 15 分�
 
 > 外掛**不是**模型、不產生 token、不代理其他 provider。它管的只有一件事：那個本機代理行程的生死。
 
-### 安裝
+### 安裝指令
 
 ```powershell
 dsh plugin --profile desktop add github:TINGOD2006/dsh-um-proxy-ondemand
@@ -79,12 +79,15 @@ dsh plugin --profile desktop add github:TINGOD2006/dsh-um-proxy-ondemand
 
 ```powershell
 # 代理本身（要先被喚醒過一次；alwaysOn: true 的話 DSH 一開就有）
-curl http://127.0.0.1:8788/health
+curl.exe http://127.0.0.1:8788/health
 # {"status":"ok","service":"um-opencode-proxy"}
 
 # 外掛自己（把埠換成你 DSH 的 GUI 埠）
-curl http://127.0.0.1:<GUI埠>/um-proxy-ondemand/api/status
+curl.exe http://127.0.0.1:<GUI埠>/um-proxy-ondemand/api/status
 ```
+
+> 用 `curl.exe` 而不是 `curl`：Windows PowerShell 5.1 把 `curl` 別名成 `Invoke-WebRequest`，
+> 參數與輸出都不是 curl 的樣子。
 
 設定頁的「狀態」區塊看得到同樣的資訊：`running`、`pid`、`alwaysOn`、`idleTimerArmed`、請求數與喚醒數。實際用法是回 DSH 選一個 `um-genai` 的模型送一句話——第一次會冷啟動（幾秒），之後走熱路徑。
 
@@ -94,7 +97,7 @@ curl http://127.0.0.1:<GUI埠>/um-proxy-ondemand/api/status
 | --- | --- | --- |
 | 設定頁顯示「找不到腳本」 | `~/.um-opencode/um_opencode_setup.py` 不存在 | 先跑 UM 的校內安裝流程；或把 `UM_OPENCODE_HOME` / 設定頁的「腳本路徑」指到正確位置 |
 | 冷啟動失敗，日誌有 `ENOENT` | Python 路徑不對 | 在設定頁填 `pythonw.exe` 的絕對路徑，或設 `UM_PYTHON` |
-| 回 401 | 上游 UM 登入 token 過期（不是 API key 錯） | 跑 `python scripts/um-recover.ps1 -Fix`，或等續期看門狗；詳見下方〈反代 401〉一節 |
+| 回 401 | 上游 UM 登入 token 過期（不是 API key 錯） | 跑 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix`，或等續期看門狗；詳見下方〈反代 401〉一節 |
 | 埠被佔用 | 8788 上已經有別的行程在聽 | 設定頁改 `port`，或先找出佔用者；外掛不會殺不屬於自己的行程 |
 | 設定頁整頁空白 | 分頁沒註冊成功（少見） | 重啟 DSH；仍空白就查 `~/.dsh/profiles/desktop` 的 log |
 
@@ -105,7 +108,7 @@ dsh plugin --profile desktop remove dsh-um-proxy-ondemand
 ```
 
 移除只拿掉外掛本身。已經在跑的代理行程不會被帶走（`alwaysOn: true` 的設計就是不讓 DSH 的生命週期管它），
-要一起收掉就 `python ~/.um-opencode/um_opencode_setup.py stop`；排程工作（如果建過）用
+要一起收掉就 `python "$env:USERPROFILE\.um-opencode\um_opencode_setup.py" stop`；排程工作（如果建過）用
 `schtasks /Delete /TN "\UMGenAIProxy-Renew" /F` 清掉。
 
 ## 它怎麼運作
@@ -161,14 +164,19 @@ health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死�
 | 檔案 | 作用 |
 | --- | --- |
 | `package.json` | DSH bundle 契約（`type: module`、`exports`、`dsh.bundle.patch`）。 |
-| `cordis.patch.yml` | 插入條目與設定（`port: 8788`、`idleMinutes: 15`）。 |
+| `cordis.patch.yml` | 插入條目與「每台機器都一樣」的設定（`port: 8788`、`alwaysOn: true`）。個人路徑不要寫在這裡。 |
+| `lib/paths.js` | 可移植的預設值：`homeDir` / `scriptPath` / `logPath` / `statePath` / `detectPython` / `defaultsOf`。從 `UM_OPENCODE_HOME`、`UM_PYTHON`、`%LOCALAPPDATA%`、`PATH` 推導，不寫死任何一台機器的路徑。 |
 | `lib/proxy.js` | 代理生命週期：`healthDetail` / `health` / `ensureProxy`（single-flight） / `stopProxy` / `listeningPids`、狀態檔節流。不依賴 cordis。 |
+| `lib/process.js` | 找 listener／找代理行程／安全終止：只殺認得出是自己那支腳本的行程。 |
 | `lib/index.js` | 事件接線（`llm/stream`）、閒置計時器、唯讀狀態端點、啟動清理與關閉清理。 |
+| `lib/settings-api.js` | 設定頁的後端：`/um-proxy-ondemand/api` 底下的 status／settings／account／key，含憑證寫入與金鑰儲存。 |
+| `lib/client.js` | 設定頁的前端 bundle（手寫的模組載入器格式，只依賴 `react`，沒有建置步驟）。 |
 | `test/ondemand_check.mjs` | 生命週期：冷啟動、沿用、停止、冪等、重複監聽。 |
 | `test/plugin_wiring.mjs` | 用 mock ctx 跑真的 `apply()`：非目標 provider 零成本放行、目標 provider 喚醒並轉送串流。 |
 | `test/idle_timeout.mjs` | 閒置自動關閉（用 `idleSeconds: 3` 壓縮週期）。 |
 | `test/coldstart.mjs` | 冷啟動計時，供無視窗驗證使用。 |
 | `test/efficiency_unit.mjs` | 純單元測試（不寫檔、不起代理）：single-flight、輪詢排程、狀態檔節流、`healthDetail` 判定。 |
+| `test/paths_unit.mjs` | 純單元測試：家目錄與四個路徑的推導、Python 偵測順序、`defaultsOf` 不含作者機器的路徑。 |
 | `scripts/um-recover.ps1` | 反代自救腳本：診斷 401（上游 UM token 過期 vs `local-api-key` 不對），可 `-Fix` 自動重新登入。 |
 | `scripts/um-renew.py` | 續期看門狗（獨立於代理）：每 5 分鐘檢查 JWT `exp`、**距上次成功續期的時間**和 gateway 是否真的接受 token，需要時自動跑 `login`、清掉殘留的登入 Chrome、先把登入瀏覽器放到隱藏桌面，並在續期後實測新 token。 |
 | `scripts/um_hidden_window.py` | 把登入用的 Chrome 開在私有的 Win32 桌面上（使用者看不到，但渲染與 DevTools 照常），並把它的 debug 埠發佈到 `browser-debug-port`；可 `--status`／`--ensure`／`--close`／`--probe`。 |
@@ -767,9 +775,13 @@ npm test
 - **要 Node.js 24** 跑測試（`plugin_stability` 用實驗性的 module mock）；外掛本身在 22 以上就行。
 - **`UM_TEST_PYTHON`** 指定測試用的 Python；不影響正式代理用的那一個。沒設就自動偵測。
 - 生命週期測試在隨機回環埠啟停 `test/fixtures/proxy.py`，不會動到正式 8788，也不會開真實登入瀏覽器或讀真實憑證。
-- 單跑一支：`node test/always_on.mjs`、`node test/efficiency_unit.mjs`、`python -m unittest test.hidden_window_stability` 之類。
+- 單跑一支：`node test/always_on.mjs`、`node test/efficiency_unit.mjs`、`node test/paths_unit.mjs`、`python -m unittest test.hidden_window_stability` 之類。
 - **不要 commit 本機化設定。** `cordis.patch.yml` 必須保持通用值（只有 `port` 與 `alwaysOn`）；`package.json` 的 python 指令不要寫死某台機器的路徑。個人路徑請留在**你自己 profile** 的 `cordis.patch.yml` 或設定頁裡——那裡本來就是拿來覆寫的。同理，README 裡的範例路徑請用 `%USERPROFILE%` 或 `<本 repo 目錄>`，不要貼自己的絕對路徑。
 - 改 `lib/client.js` 不需要建置步驟（手寫的模組載入器格式），存檔後重新整理頁面就生效；**新增**設定分頁才要重啟 DSH。
 - 行為改動請附一支釘住它的回歸測試。這個 repo 的既有慣例是「測試名稱直接說明它防的是哪個事故」。
+
+## 授權
+
+MIT，見 [LICENSE](LICENSE)。
 
 
