@@ -437,6 +437,7 @@ def rebuild_dsh_models(lines: list[str], entries: list[dict], provider: str = "u
 
     models_index = None
     models_indent = 0
+    models_inline_empty = False
     for index in range(provider_index + 1, len(out)):
         line = out[index]
         if not line.strip() or line.lstrip().startswith("#"):
@@ -444,8 +445,12 @@ def rebuild_dsh_models(lines: list[str], entries: list[dict], provider: str = "u
         indent = indent_of(line)
         if indent <= provider_indent:
             break
-        if re.match(r"^\s*models:\s*$", line):
+        # `models:` (block form) and `models: []` (what a YAML writer emits for an
+        # empty list) both count; the inline form is rewritten to block form below.
+        match = re.match(r"^(\s*)models:\s*(\[\s*\])?\s*$", line)
+        if match:
             models_index, models_indent = index, indent
+            models_inline_empty = bool(match.group(2))
             break
     if models_index is None:
         raise SyncError(f"the '{provider}:' provider has no 'models:' list")
@@ -471,6 +476,8 @@ def rebuild_dsh_models(lines: list[str], entries: list[dict], provider: str = "u
         end = len(out)
     if start is None:
         start = end = models_index + 1
+    if models_inline_empty:
+        out[models_index] = " " * models_indent + "models:\n"
 
     for line in out[start:end]:
         if line.strip().startswith("#"):

@@ -66,18 +66,21 @@ function fakeEntry(id = ENTRY_ID) {
   return { options: { id, name: id }, fiber: null, ctx: null }
 }
 
-/** 假 configEditor。 */
+/** 假 configEditor。edit 會把結果留下來，讓連續兩次 edit 看到彼此的結果。 */
 function fakeEditor(options = {}) {
   const calls = []
   const entry = options.entry ?? fakeEntry()
   const rows = options.rows ?? [{ entry, inherited: { port: 8788, alwaysOn: true }, override: {} }]
+  let state = options.base ?? { port: 8788, alwaysOn: true }
   return {
     calls,
     entry,
     entries: () => (options.noEntries ? [] : [entry]),
     configuration: () => rows,
     edit: async (target, change) => {
-      calls.push({ target, next: change(options.base ?? { port: 8788, alwaysOn: true }, {}) })
+      const next = change(state, {})
+      state = next
+      calls.push({ target, next })
     },
   }
 }
@@ -563,7 +566,7 @@ test('POST /provider 會建立 provider 並回報模型同步結果', async () =
   assert.equal(syncCalls[0].profilePath, null)
 })
 
-test('POST /provider：模型同步失敗不算整支失敗，錯誤照實回報', async () => {
+test('POST /provider：模型同步失敗時回滾剛建立的 provider', async () => {
   const editor = fakeEditorWithLlm()
   const ctx = { get: (name) => (name === 'configEditor' ? editor : undefined), logger: { warn() {} } }
   const { route } = mount(ctx, {
@@ -579,6 +582,30 @@ test('POST /provider：模型同步失敗不算整支失敗，錯誤照實回報
   assert.equal(res.body.created, true)
   assert.equal(res.body.models.ok, false)
   assert.match(res.body.models.error, /not running/)
+  // 留著空 models 的 provider 會讓 DSH 載入失敗，所以剛建立的必須收回
+  assert.equal(res.body.rolledBack, true)
+  const last = editor.calls[editor.calls.length - 1].next
+  assert.equal(last.providers?.['um-genai'], undefined)
+})
+
+test('POST /provider：同步失敗但 provider 本來就有時不回滾', async () => {
+  const editor = fakeEditorWithLlm({
+    base: { providers: { 'um-genai': { displayName: 'mine', models: [{ id: 'x' }] } } },
+  })
+  const ctx = { get: (name) => (name === 'configEditor' ? editor : undefined), logger: { warn() {} } }
+  const { route } = mount(ctx, {
+    ...baseOptions,
+    syncModels: async () => {
+      throw new Error('proxy is not running')
+    },
+  })
+
+  const res = await call(route, 'POST', '/provider', {})
+
+  assert.equal(res.body.created, false)
+  assert.equal(res.body.rolledBack, false)
+  const last = editor.calls[editor.calls.length - 1].next
+  assert.equal(last.providers['um-genai'].displayName, 'mine')
 })
 
 test('POST /provider 在沒有 configEditor 時回 503', async () => {

@@ -210,6 +210,27 @@ class Stability(unittest.TestCase):
             self.assertEqual(config.read_text(), original)
             self.assertEqual({file.name for file in root.iterdir()}, {"opencode.json", "registry.json", "key"})
 
+    def test_dsh_models_list_accepts_an_inline_empty_array(self):
+        # A YAML writer (the settings page's configEditor) emits `models: []` for an
+        # empty list; the rebuilder must splice into that form too, otherwise a fresh
+        # install can never fill the list in.
+        entries = [
+            {"id": "Example-1", "display": "Example", "contextWindow": 1000, "maxTokens": 100, "input": ["text"]}
+        ]
+        for source in [
+            "  um-genai:\n    displayName: UM\n    models: []\n",
+            "  um-genai:\n    displayName: UM\n    models:\n",
+        ]:
+            rebuilt, changes = models.rebuild_dsh_models(source.splitlines(keepends=True), entries)
+            text = "".join(rebuilt)
+            self.assertIn("    models:\n", text)
+            self.assertIn("      - id: Example-1\n", text)
+            self.assertNotIn("models: []", text)
+            self.assertEqual(len(changes), 1)
+            # the rebuilt text must round-trip through the same rebuilder
+            again, _ = models.rebuild_dsh_models(rebuilt, entries)
+            self.assertEqual("".join(again), text)
+
     def test_failed_atomic_replace_preserves_original_and_cleans_temporary_file(self):
         with tempfile.TemporaryDirectory(prefix="dsh-replace-") as directory:
             config = Path(directory) / "config.json"

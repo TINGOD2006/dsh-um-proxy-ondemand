@@ -103,6 +103,8 @@ dsh plugin --profile desktop add github:TINGOD2006/dsh-um-proxy-ondemand
 
 按鈕已經有 provider 時只會補缺的鍵，你手動調過的 `displayName`、埠號、模型子集都不會被蓋掉。
 
+如果按鈕**剛建立** provider 卻抓不到模型清單（最常見是還沒登入 UM 帳號、代理起不來），它會把剛寫進去的 provider 收回，而不是留下一個 `models` 空白的 provider —— 後者會讓 DSH 載入時直接報 `provider "um-genai" resolves no models`。先到「UM 帳號」登入、確認代理跑得起來，再按一次就好。
+
 ### 環境變數
 
 | 變數 | 預設 | 作用 |
