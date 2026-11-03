@@ -89,13 +89,14 @@ curl.exe http://127.0.0.1:<GUI埠>/um-proxy-ondemand/api/status
 > 用 `curl.exe` 而不是 `curl`：Windows PowerShell 5.1 把 `curl` 別名成 `Invoke-WebRequest`，
 > 參數與輸出都不是 curl 的樣子。
 
-設定頁的「狀態」區塊看得到同樣的資訊：`running`、`pid`、`alwaysOn`、`idleTimerArmed`、請求數與喚醒數。實際用法是回 DSH 選一個 `um-genai` 的模型送一句話——第一次會冷啟動（幾秒），之後走熱路徑。
+設定頁的「狀態」區塊看得到同樣的資訊：`running`、`pid`、`alwaysOn`、`idleTimerArmed`、請求數與喚醒數。`/api/status` 另外回報 `host.script: { path, exists }`——`exists: false` 就是代理腳本還沒裝到那個路徑，設定頁會同時顯示紅字警告。實際用法是回 DSH 選一個 `um-genai` 的模型送一句話——第一次會冷啟動（幾秒），之後走熱路徑。
 
 ### 常見錯誤
 
 | 症狀 | 原因 | 處理 |
 | --- | --- | --- |
 | 設定頁顯示「找不到腳本」 | `~/.um-opencode/um_opencode_setup.py` 不存在 | 先跑 UM 的校內安裝流程；或把 `UM_OPENCODE_HOME` / 設定頁的「腳本路徑」指到正確位置 |
+| 喚醒失敗，錯誤訊息是 `proxy script not found: <路徑> — this file is not part of the plugin` | 同上：外掛找不到代理腳本，所以連 spawn 都沒發生 | 這句是外掛自己給的（不是 Python 的 `can't open file`）。把它指到正確的 `um_opencode_setup.py`，或設 `UM_OPENCODE_HOME`。狀態端點會回報 `host.script: { path, exists: false }`，設定頁狀態區塊同時顯示紅字警告 |
 | 冷啟動失敗，日誌有 `ENOENT` | Python 路徑不對 | 在設定頁填 `pythonw.exe` 的絕對路徑，或設 `UM_PYTHON` |
 | 回 401 | 上游 UM 登入 token 過期（不是 API key 錯） | 跑 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix`，或等續期看門狗；詳見下方〈反代 401〉一節 |
 | 埠被佔用 | 8788 上已經有別的行程在聽 | 設定頁改 `port`，或先找出佔用者；外掛不會殺不屬於自己的行程 |
@@ -141,6 +142,7 @@ DSH 關閉 → 順手關掉代理（不留孤兒行程）
 | 停止時檢查所有監聽者，只終止確認屬於此代理者 | 每個 PID 都須符合 Python 路徑、完整腳本路徑、`serve` 與埠號；外來服務會保留並回報停止未完成。 |
 | 不以 `state.pid` 作為終止依據 | Windows 會回收 PID。netstat 或 CIM 無法確認時會回報失敗，不退回舊狀態檔猜測。 |
 | 冷啟動時 `detached + windowsHide`，對象是 `pythonw.exe` | GUI 子系統 ＋ `DETACHED_PROCESS` ⇒ 不產生任何主控台視窗（已實測，見下）。 |
+| spawn 前先檢查代理腳本存在 | 腳本不在外掛裡，第一次安裝最常見的失敗就是它。自己先報 `proxy script not found: <路徑>` 比讓使用者去讀 Python 的 `can't open file` 或一句 `did not become healthy` 有用得多。 |
 
 ## 效率：熱路徑與喚醒延遲
 
@@ -764,7 +766,7 @@ npm test
 
 | 指令 | 內容 | 碰得到 8788 嗎 |
 | --- | --- | --- |
-| `npm run test:unit` | 純單元：single-flight、輪詢排程、狀態檔節流、`healthDetail` 判定 | 不會 |
+| `npm run test:unit` | 純單元，兩支：`efficiency_unit`（single-flight、輪詢排程、狀態檔節流、`healthDetail` 判定）＋ `paths_unit`（家目錄與四個路徑推導、Python 偵測順序、`defaultsOf` 不含作者機器的路徑） | 不會 |
 | `npm run test:always-on` | 常駐模式 9 項（啟動即喚醒、閒置不關、狀態端點、卸載不帶走代理） | 隨機回環埠 |
 | `npm run test:stability` | `proxy_stability` ＋ `plugin_stability`（後者要 `--experimental-test-module-mocks`） | 隨機回環埠 |
 | `npm run test:settings` | 設定頁 API（`lib/settings-api.js`） | 不會 |
