@@ -13,7 +13,7 @@ import os from 'node:os'
 import path from 'node:path'
 import assert from 'node:assert/strict'
 
-import { DEFAULT_PORT, defaultsOf, detectPython, detectPythonCli, homeDir, logPath, scriptPath, statePath } from '../lib/paths.js'
+import { bundledScriptPath, DEFAULT_PORT, defaultsOf, detectPython, detectPythonCli, homeDir, logPath, resolveScript, scriptPath, statePath } from '../lib/paths.js'
 
 let failures = 0
 const check = (label, fn) => {
@@ -85,6 +85,27 @@ check('defaultsOf 的每個路徑都落在指定的家目錄底下', () => {
   assert.equal(defaults.script, path.join(fakeHome, 'um_opencode_setup.py'))
   assert.equal(defaults.logFile, path.join(fakeHome, 'proxy.log'))
   assert.equal(defaults.stateFile, path.join(fakeHome, 'ondemand-8788.state.json'))
+})
+// ── 代理腳本：家目錄優先，沒有才用自帶副本 ──────────────────────────────
+check('resolveScript：家目錄有就用家目錄那份', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-paths-home-'))
+  const local = path.join(home, 'um_opencode_setup.py')
+  fs.writeFileSync(local, '# local copy\n')
+  try {
+    assert.equal(resolveScript(local), local)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+check('resolveScript：家目錄沒有就退回 vendor 副本', () => {
+  const missing = path.join(os.tmpdir(), 'dsh-paths-missing', 'um_opencode_setup.py')
+  assert.equal(resolveScript(missing), bundledScriptPath())
+})
+check('vendor 副本真的存在，而且就是代理腳本', () => {
+  const bundled = bundledScriptPath()
+  assert.ok(fs.statSync(bundled).isFile(), `找不到 ${bundled}`)
+  const head = fs.readFileSync(bundled, 'utf8').slice(0, 200)
+  assert.match(head, /um_opencode_setup|UM GenAI/i)
 })
 check('defaultsOf 不含作者機器的路徑', () => {
   const text = JSON.stringify(defaultsOf({ UM_OPENCODE_HOME: 'D:\\someone\\.um-opencode' }, DEFAULT_PORT))
