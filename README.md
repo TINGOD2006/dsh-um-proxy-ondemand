@@ -25,7 +25,7 @@ headless Chrome）。這個外掛把它改成 **按需喚醒 ＋ 閒置 15 分�
 dsh plugin --profile desktop add dsh-um-proxy-ondemand
 ```
 
-這是首選：從 npm registry 抓發佈快照（目前 `1.4.0`），不必讓 pnpm 從 git 建置，也吃得到 registry 的快取。
+這是首選：從 npm registry 抓發佈快照（`latest` 標籤，目前是 1.4.x），不必讓 pnpm 從 git 建置，也吃得到 registry 的快取。
 
 想跟 `main` 最新 commit（例如還沒發版的修正）就改用 git 來源：
 
