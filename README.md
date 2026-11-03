@@ -842,6 +842,7 @@ npm test
 - **要 Node.js 24** 跑測試（`plugin_stability` 用實驗性的 module mock）；外掛本身在 22 以上就行。
 - **`UM_TEST_PYTHON`** 指定測試用的 Python；不影響正式代理用的那一個。沒設就自動偵測。
 - 生命週期測試在隨機回環埠啟停 `test/fixtures/proxy.py`，不會動到正式 8788，也不會開真實登入瀏覽器或讀真實憑證。
+- **測試不能依賴這台機器。** `detectPython` 會掃 `C:\Python3*`，所以在裝了 Python 的機器上「什麼都找不到」那條測試會假性失敗——用 `detectPython(env, { systemRoot: <不存在的目錄> })` 把那一檔關掉。同理 `renew_stability` 要把 `LAST_SUCCESS_FILE` 指到暫存目錄，否則「距上次成功續期超過 25 分鐘」會讓測試忽然開始登入，通過與否取決於上一次真實續期是多久以前。
 - 單跑一支：`node test/always_on.mjs`、`node test/efficiency_unit.mjs`、`node test/paths_unit.mjs`、`python -m unittest test.hidden_window_stability` 之類。
 - **不要 commit 本機化設定。** `cordis.patch.yml` 必須保持通用值（只有 `port` 與 `alwaysOn`）；`package.json` 的 python 指令不要寫死某台機器的路徑。個人路徑請留在**你自己 profile** 的 `cordis.patch.yml` 或設定頁裡——那裡本來就是拿來覆寫的。同理，README 裡的範例路徑請用 `%USERPROFILE%` 或 `<本 repo 目錄>`，不要貼自己的絕對路徑。
 - 改 `lib/client.js` 不需要建置步驟（手寫的模組載入器格式），存檔後重新整理頁面就生效；**新增**設定分頁才要重啟 DSH。

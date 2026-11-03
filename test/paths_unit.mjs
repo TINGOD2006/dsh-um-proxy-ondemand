@@ -63,8 +63,12 @@ check('非 Windows 一律用 python3', () => {
   assert.equal(detectPythonCli({}, { platform: 'linux' }), 'python3')
 })
 check('什麼都找不到時退回字面值，讓 spawn 用 PATH 解析', () => {
-  // 空 PATH + 空的 LOCALAPPDATA，且 C:\ 底下沒有 Python3*（在 CI 上通常是這樣）。
-  const result = detectPython({ PATH: '', LOCALAPPDATA: path.join(fakeHome, 'nope'), PATHEXT: '.EXE' })
+  // 空 PATH + 空的 LOCALAPPDATA，且把 `C:\` 那一檔掃描指到不存在的目錄。
+  // 不關掉它，這條測試就只在「機器上沒有 C:\Python3*」時才成立。
+  const result = detectPython(
+    { PATH: '', LOCALAPPDATA: path.join(fakeHome, 'nope'), PATHEXT: '.EXE' },
+    { systemRoot: path.join(fakeHome, 'nope') },
+  )
   assert.ok(result === 'pythonw.exe' || /pythonw\.exe$/i.test(result), result)
 })
 check('PATH 上的 pythonw 會被找到', () => {
@@ -73,7 +77,10 @@ check('PATH 上的 pythonw 會被找到', () => {
   fs.mkdirSync(bin, { recursive: true })
   const exe = path.join(bin, 'pythonw.exe')
   fs.writeFileSync(exe, '')
-  const found = detectPython({ PATH: bin, LOCALAPPDATA: path.join(fakeHome, 'nope'), PATHEXT: '.EXE' })
+  const found = detectPython(
+    { PATH: bin, LOCALAPPDATA: path.join(fakeHome, 'nope'), PATHEXT: '.EXE' },
+    { systemRoot: path.join(fakeHome, 'nope') },
+  )
   assert.equal(found.toLowerCase(), exe.toLowerCase())
 })
 
@@ -108,9 +115,23 @@ check('vendor 副本真的存在，而且就是代理腳本', () => {
   assert.match(head, /um_opencode_setup|UM GenAI/i)
 })
 check('defaultsOf 不含作者機器的路徑', () => {
-  const text = JSON.stringify(defaultsOf({ UM_OPENCODE_HOME: 'D:\\someone\\.um-opencode' }, DEFAULT_PORT))
+  // 把 `C:\` 掃描關掉，否則在作者自己的機器上偵測到的就是 C:\Python314\pythonw.exe
+  // ——那是「推導出來的」，不是「寫死的」，但字串長得一樣，測不出差別。
+  const text = JSON.stringify(
+    defaultsOf({ UM_OPENCODE_HOME: 'D:\\someone\\.um-opencode' }, DEFAULT_PORT, {
+      systemRoot: path.join(fakeHome, 'nope'),
+    }),
+  )
   for (const forbidden of ['TINGOD', 'Python314', 'C:\\Users\\TINGOD']) {
     assert.ok(!text.includes(forbidden), `預設值不該含 ${forbidden}：${text}`)
+  }
+})
+check('lib/paths.js 的原始碼沒有寫死作者機器的路徑', () => {
+  // 上一條驗的是「推導結果」，這一條驗的是「原始碼」：就算推導結果剛好一樣，
+  // 原始碼裡也不該出現作者的使用者名稱或 Python 版本目錄。
+  const source = fs.readFileSync(new URL('../lib/paths.js', import.meta.url), 'utf8')
+  for (const forbidden of ['TINGOD', 'Python314', 'C:\\Users\\']) {
+    assert.ok(!source.includes(forbidden), `lib/paths.js 不該出現 ${forbidden}`)
   }
 })
 

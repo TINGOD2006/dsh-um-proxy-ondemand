@@ -20,6 +20,10 @@ class RenewalStability(unittest.TestCase):
         for name, value in {
             'HOME': self.root, 'BACKOFF_FILE': self.root / 'backoff',
             'LOCK_FILE': self.root / 'lock', 'TOKEN_FILE': self.root / 'token',
+            # 續期時鐘也要隔離：不隔離就會讀到真實的 renew-watchdog.last-success，
+            # 於是「距上次成功續期超過 25 分鐘」時這組測試會突然開始登入，
+            # 通過與否取決於上一次真實續期是多久以前。
+            'LAST_SUCCESS_FILE': self.root / 'last-success',
         }.items():
             self.stack.enter_context(patch.object(renew, name, value))
         self.stack.enter_context(patch.object(renew, 'log'))
