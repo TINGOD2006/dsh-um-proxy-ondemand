@@ -86,10 +86,21 @@ test('missing executable rejects instead of terminating the Node host', async ()
   await assert.rejects(ensureProxy({ port, python: 'C:\\__missing_dsh_python__\\python.exe', startupTimeoutMs: 100 }), { code: 'ENOENT' })
 })
 
+test('a missing proxy script is rejected before anything is spawned', async () => {
+  const port = await freePort()
+  await assert.rejects(
+    ensureProxy({ port, python, script: path.join(path.dirname(fixture), '__missing_fixture__.py'), startupTimeoutMs: 3000 }),
+    /proxy script not found/,
+  )
+  assert.deepEqual(await listenerPids(port), [])
+})
+
 test('child exiting before readiness fails promptly without a timeout retry', async () => {
   const before = wakeRetryCount()
   const port = await freePort()
-  await assert.rejects(ensureProxy({ port, python, script: path.join(path.dirname(fixture), '__missing_fixture__.py'), startupTimeoutMs: 3000 }), /exited before becoming healthy/)
+  // 這支 fixture 存在但立刻結束 —— 預檢擋的是「檔案不存在」，不是「起不來」。
+  const dying = fileURLToPath(new URL('./fixtures/exit_now.py', import.meta.url))
+  await assert.rejects(ensureProxy({ port, python, script: dying, startupTimeoutMs: 3000 }), /exited before becoming healthy/)
   assert.equal(wakeRetryCount(), before)
   assert.deepEqual(await listenerPids(port), [])
 })
