@@ -167,7 +167,8 @@ health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死�
 
 | 檔案 | 作用 |
 | --- | --- |
-| `package.json` | DSH bundle 契約（`type: module`、`exports`、`dsh.bundle.patch`）。 |
+| `package.json` | DSH bundle 契約（`type: module`、`exports`、`dsh.bundle.patch`）與 `files`（含 `vendor/`）。 |
+| `.gitattributes` | 讓 `vendor/um_opencode_setup.py` 以 LF 存放，這樣它的 sha256 才對得上 `vendor/README.md` 記的值。 |
 | `cordis.patch.yml` | 插入條目與「每台機器都一樣」的設定（`port: 8788`、`alwaysOn: true`）。個人路徑不要寫在這裡。 |
 | `lib/paths.js` | 可移植的預設值：`homeDir` / `scriptPath` / `bundledScriptPath` / `resolveScript` / `logPath` / `statePath` / `detectPython` / `defaultsOf`。從 `UM_OPENCODE_HOME`、`UM_PYTHON`、`%LOCALAPPDATA%`、`PATH` 推導，不寫死任何一台機器的路徑。 |
 | `lib/proxy.js` | 代理生命週期：`healthDetail` / `health` / `ensureProxy`（single-flight） / `stopProxy` / `listeningPids`、狀態檔節流。不依賴 cordis。 |
