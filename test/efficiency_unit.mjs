@@ -13,8 +13,11 @@
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { createServer } from 'node:net'
+import os from 'node:os'
+import path from 'node:path'
 
 import {
+  ensureProxy,
   healthDetail,
   inflightCount,
   isRecoverableWakeError,
@@ -154,6 +157,25 @@ test('isRecoverableWakeError：只重試自家代理冷啟動逾時', () => {
 test('wakeRetryCount：一開始是 0（重試次數可觀測）', () => {
   assert.equal(typeof wakeRetryCount(), 'number')
   assert.equal(wakeRetryCount(), 0)
+})
+
+test('ensureProxy：腳本不存在時給出可操作的錯誤，而不是 spawn 失敗', async () => {
+  const tmp = os.tmpdir()
+  await assert.rejects(
+    () =>
+      ensureProxy({
+        port: 63999,
+        script: path.join(tmp, 'um-test-missing', 'um_opencode_setup.py'),
+        stateFile: path.join(tmp, 'um-test-missing.state.json'),
+        logFile: path.join(tmp, 'um-test-missing.log'),
+      }),
+    err => {
+      assert.match(err.message, /proxy script not found/)
+      assert.match(err.message, /um_opencode_setup\.py/)
+      assert.match(err.message, /UM_OPENCODE_HOME/)
+      return true
+    },
+  )
 })
 
 let failed = 0
