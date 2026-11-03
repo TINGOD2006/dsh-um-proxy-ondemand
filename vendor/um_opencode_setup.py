@@ -1073,6 +1073,10 @@ _last_renew_attempt = 0.0
 _last_login_prompt = 0.0
 RENEW_COOLDOWN = 60.0
 LOGIN_PROMPT_COOLDOWN = 600.0
+# The UM gateway answers 502/503/504 when its own model backend is unreachable,
+# which usually clears within seconds. Retry those before reporting a failure.
+UPSTREAM_RETRY_DELAYS = (1.0, 3.0, 6.0)
+UPSTREAM_RETRY_STATUSES = (502, 503, 504)
 SESSION_EXPIRED_MESSAGE = (
     "UM session expired and could not be renewed automatically. A private login window "
     "was opened: sign in at https://chat.genai.um.edu.mo/ there and the proxy recovers "
@@ -2373,6 +2377,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
         connection.request(method, path, body=body, headers=headers)
         return connection, connection.getresponse()
 
+    def upstream_with_retry(self, method: str, path: str, body: bytes | None = None):
+        """Send one upstream request, retrying the gateway's transient failures.
+
+        A 502/503/504 from the UM gateway means its own model backend is
+        unreachable, not that the token is bad, so the retry only renews the
+        token when a probe proves the gateway rejected it. Renewing on every
+        5xx would turn a UM outage into a login storm.
+        """
+        delays = UPSTREAM_RETRY_DELAYS
+        checked = False
+        for attempt in range(len(delays) + 1):
+            try:
+                connection, response = self.upstream(method, path, body)
+            except (OSError, http.client.HTTPException):
+                if attempt >= len(delays):
+                    raise
+                time.sleep(delays[attempt])
+                continue
+            if response.status not in UPSTREAM_RETRY_STATUSES:
+                return connection, response
+            if attempt >= len(delays):
+                return connection, response
+            try:
+                response.read()
+            except (OSError, http.client.HTTPException):
+                pass
+            connection.close()
+            if not checked:
+                checked = True
+                if probe_um_token(current_token()) is False:
+                    renew_token_once()
+            time.sleep(delays[attempt])
+        raise AssertionError("unreachable")
+
     def do_GET(self) -> None:  # noqa: N802
         path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
         if path in {"/", "/health"}:
@@ -2386,7 +2424,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         connection = None
         try:
-            connection, response = self.upstream("GET", "/api/models")
+            connection, response = self.upstream_with_retry("GET", "/api/models")
             body = response.read()
             if response.status in (401, 403) and renew_token_once():
                 connection.close()
@@ -2445,7 +2483,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         ).encode()
         connection = None
         try:
-            connection, response = self.upstream("POST", "/api/chat/completions", clean_body)
+            connection, response = self.upstream_with_retry(
+                "POST", "/api/chat/completions", clean_body
+            )
             if response.status in (401, 403):
                 # The UM session expired while the proxy was running: renew once and
                 # retry, so an expiry the watchdog has not seen yet stays invisible.

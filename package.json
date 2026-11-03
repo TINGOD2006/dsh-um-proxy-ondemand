@@ -1,6 +1,6 @@
 {
   "name": "dsh-um-proxy-ondemand",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "Wake the local UM GenAI proxy (127.0.0.1:8788) only when DSH actually uses the um-genai provider, stop it after an idle period, and manage it from a DSH settings page.",
   "type": "module",
   "license": "MIT",

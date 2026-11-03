@@ -138,6 +138,7 @@ curl.exe http://127.0.0.1:<GUI埠>/um-proxy-ondemand/api/status
 | 冷啟動失敗，日誌有 `ENOENT` | Python 路徑不對 | 在設定頁填 `pythonw.exe` 的絕對路徑，或設 `UM_PYTHON` |
 | 回 401 | 上游 UM 登入 token 過期（不是 API key 錯） | 跑 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix`，或等續期看門狗；詳見下方〈反代 401〉一節 |
 | 埠被佔用 | 8788 上已經有別的行程在聽 | 設定頁改 `port`，或先找出佔用者；外掛不會殺不屬於自己的行程 |
+| 回 502／503／504 | UM 自己的模型後端連不上（503 的 body 是 Envoy 的 `upstream connect error`），不是本地設定錯 | 代理會自動重試 3 次（1s／3s／6s）；仍失敗就是 UM 那邊還沒恢復，等幾分鐘再試。詳見下方〈上游 5xx〉一節 |
 | 設定頁整頁空白 | 分頁沒註冊成功（少見） | 重啟 DSH；仍空白就查 `~/.dsh/profiles/desktop` 的 log |
 
 ### 移除
@@ -340,6 +341,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix
   → `PermissionError: [WinError 5]`；請在一般 PowerShell／cmd 視窗執行。
 - 想根治：登入後把那個 UM 登入視窗留著（有 debug port 可重複用）或完全關掉再讓它靜默續期；
   最怕的是「活著但沒有 debug port」的殘留 Chrome。
+
+## 上游 5xx：UM 自己的後端掛掉
+
+UM 的 gateway 在自家模型後端連不上時，會回 **503**，body 是 Envoy 的
+`upstream connect error ... transport failure reason: ...`；連線層失敗是 **502**，逾時是 **504**。
+這三種都**不是**本地設定或 token 的問題，重登也沒有用。
+
+代理的處理（`vendor/um_opencode_setup.py` 的 `ProxyHandler.upstream_with_retry()`）：
+
+1. 502／503／504 或連線例外 → 重試 3 次，退避 1s／3s／6s。
+2. 重試前先跑一次 `probe_um_token()`（`GET /api/models`）判斷 token 是否真的被拒：
+   - 回 `False`（401／403）→ 才呼叫 `renew_token_once()`，換 token 後立刻重試。
+   - 回 `None`（網路錯誤或 5xx）→ **不重登**，只退避重試。
+3. 三次都失敗才把最後那個 5xx 回給呼叫端。
+
+第 2 點是刻意的：UM 後端掛掉時盲目重登會變成登入風暴（每次重登都要開隱藏瀏覽器、可能觸發 Duo），
+而且那段時間登入本身也會失敗。所以「上游錯誤就重取 token」只在 probe 證明 token 被拒時才做。
+
+`GET /v1/models` 與 `POST /v1/chat/completions` 都走這條路徑；串流回應在開始串流前就決定要不要重試，
+所以不會出現「已經送出一半才重試」的情況。
 
 ## token 到期自動續期（排程看門狗）
 
