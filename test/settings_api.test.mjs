@@ -21,6 +21,7 @@ import {
   LLM_ENTRY_NAME,
   ensureProvider,
   findEntry,
+  modelsSyncOutcome,
   parseSettingsPatch,
   providerDefaults,
   readProvider,
@@ -585,4 +586,36 @@ test('POST /provider 在沒有 configEditor 時回 503', async () => {
   const res = await call(route, 'POST', '/provider', {})
   assert.equal(res.status, 503)
   assert.match(res.body.error, /configEditor/)
+})
+
+test('modelsSyncOutcome：0 與 20 都算成功，20 代表有改寫', () => {
+  const synced = modelsSyncOutcome(0, 'in sync: a, b', '')
+  assert.equal(synced.ok, true)
+  assert.equal(synced.changed, false)
+
+  const applied = modelsSyncOutcome(20, 'applied; restart the DSH host', '')
+  assert.equal(applied.ok, true)
+  assert.equal(applied.changed, true)
+  assert.match(applied.output, /applied/)
+})
+
+test('modelsSyncOutcome：10 / 5 / 4 都算失敗，並帶上腳本輸出', () => {
+  for (const code of [10, 5, 4]) {
+    assert.throws(
+      () => modelsSyncOutcome(code, 'drift detected', ''),
+      (err) => {
+        assert.equal(err.status, 502)
+        assert.match(err.message, /drift detected/)
+        return true
+      },
+    )
+  }
+  // 完全沒有輸出時至少講出結束碼
+  assert.throws(
+    () => modelsSyncOutcome(4, '', ''),
+    (err) => {
+      assert.match(err.message, /exit 4/)
+      return true
+    },
+  )
 })
