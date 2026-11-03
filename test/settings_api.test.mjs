@@ -18,8 +18,12 @@ import { Readable } from 'node:stream'
 import {
   API_PREFIX,
   FIELD_SPECS,
+  LLM_ENTRY_NAME,
+  ensureProvider,
   findEntry,
   parseSettingsPatch,
+  providerDefaults,
+  readProvider,
   readSettings,
   pythonForCli,
   registerSettingsApi,
@@ -413,4 +417,172 @@ test('tokenInfo 會解析 JWT 的 exp', async (t) => {
       /* 清不掉就算了 */
     }
   }
+})
+
+// ── um-genai provider ─────────────────────────────────────────────────────
+
+/** 假 configEditor，額外掛上 llm-pi-ai 條目（provider 要寫在它底下）。 */
+function fakeEditorWithLlm(options = {}) {
+  const editor = fakeEditor(options)
+  const llmEntry = options.llmEntry ?? {
+    options: { id: 'llm-pi-ai', name: LLM_ENTRY_NAME },
+    fiber: null,
+    ctx: null,
+  }
+  const all = options.noLlmEntry ? [editor.entry] : [editor.entry, llmEntry]
+  editor.entries = () => all
+  editor.llmEntry = llmEntry
+  return editor
+}
+
+test('providerDefaults 跟著埠號走，並沿用同一把金鑰參照', () => {
+  const defaults = providerDefaults({ port: 9123 })
+  assert.equal(defaults.baseURL, 'http://127.0.0.1:9123/v1')
+  assert.equal(defaults.apiKeyEnv, 'UM_GENAI_API_KEY')
+  assert.equal(defaults.api, 'openai-completions')
+  assert.deepEqual(defaults.models, [])
+  // 沒有 port 時退回預設埠，而不是 undefined
+  assert.equal(providerDefaults({}).baseURL, 'http://127.0.0.1:8788/v1')
+})
+
+test('readProvider：沒有 configEditor 時什麼都不假裝', () => {
+  const provider = readProvider({})
+  assert.deepEqual(provider, { entry: false, configured: false, models: 0, baseURL: null })
+})
+
+test('readProvider：patch 裡有 provider 就回報設定與模型數', () => {
+  const editor = fakeEditorWithLlm()
+  editor.configuration = () => [
+    {
+      entry: editor.llmEntry,
+      inherited: {},
+      override: {
+        providers: {
+          'um-genai': { baseURL: 'http://127.0.0.1:8788/v1', models: [{ id: 'a' }, { id: 'b' }] },
+        },
+      },
+    },
+  ]
+  const provider = readProvider({ get: (name) => (name === 'configEditor' ? editor : undefined) })
+  assert.equal(provider.entry, true)
+  assert.equal(provider.configured, true)
+  assert.equal(provider.models, 2)
+  assert.equal(provider.baseURL, 'http://127.0.0.1:8788/v1')
+})
+
+test('ensureProvider：沒有 configEditor 時丟 503', async () => {
+  await assert.rejects(() => ensureProvider({}, { port: 8788 }), (err) => {
+    assert.equal(err.status, 503)
+    assert.match(err.message, /configEditor/)
+    return true
+  })
+})
+
+test('ensureProvider：沒有 llm-pi-ai 條目時丟 503', async () => {
+  const editor = fakeEditorWithLlm({ noLlmEntry: true })
+  await assert.rejects(
+    () => ensureProvider({ get: (name) => (name === 'configEditor' ? editor : undefined) }, { port: 8788 }),
+    (err) => {
+      assert.equal(err.status, 503)
+      assert.match(err.message, /llm-pi-ai/)
+      return true
+    },
+  )
+})
+
+test('ensureProvider：第一次建立會寫進 providers.um-genai', async () => {
+  const editor = fakeEditorWithLlm()
+  const ctx = { get: (name) => (name === 'configEditor' ? editor : undefined) }
+  const result = await ensureProvider(ctx, { port: 9123 })
+
+  assert.equal(result.created, true)
+  assert.equal(editor.calls.length, 1)
+  assert.equal(editor.calls[0].target, editor.llmEntry)
+  const written = editor.calls[0].next
+  assert.equal(written.providers['um-genai'].baseURL, 'http://127.0.0.1:9123/v1')
+  assert.equal(written.providers['um-genai'].displayName, 'UM GenAI (local proxy)')
+})
+
+test('ensureProvider：已經有 provider 時不覆寫使用者調過的值', async () => {
+  const editor = fakeEditorWithLlm()
+  editor.edit = async (target, change) => {
+    const next = change(
+      { providers: { 'um-genai': { displayName: '我的名字', models: [{ id: 'x' }] } } },
+      {},
+    )
+    editor.calls.push({ target, next })
+  }
+  const ctx = { get: (name) => (name === 'configEditor' ? editor : undefined) }
+  const result = await ensureProvider(ctx, { port: 8788 })
+
+  assert.equal(result.created, false)
+  const provider = editor.calls[0].next.providers['um-genai']
+  assert.equal(provider.displayName, '我的名字')
+  assert.deepEqual(provider.models, [{ id: 'x' }])
+  // 缺的鍵要補上
+  assert.equal(provider.apiKeyEnv, 'UM_GENAI_API_KEY')
+  assert.equal(provider.baseURL, 'http://127.0.0.1:8788/v1')
+})
+
+test('ensureProvider：保留 llm-pi-ai 上其他 provider', async () => {
+  const editor = fakeEditorWithLlm()
+  editor.edit = async (target, change) => {
+    editor.calls.push({
+      target,
+      next: change({ providers: { other: { baseURL: 'http://x' } } }, {}),
+    })
+  }
+  const ctx = { get: (name) => (name === 'configEditor' ? editor : undefined) }
+  await ensureProvider(ctx, { port: 8788 })
+  const providers = editor.calls[0].next.providers
+  assert.deepEqual(providers.other, { baseURL: 'http://x' })
+  assert.ok(providers['um-genai'])
+})
+
+test('POST /provider 會建立 provider 並回報模型同步結果', async () => {
+  const editor = fakeEditorWithLlm()
+  const syncCalls = []
+  const ctx = { get: (name) => (name === 'configEditor' ? editor : undefined), logger: { warn() {} } }
+  const { route } = mount(ctx, {
+    ...baseOptions,
+    syncModels: async (cfg, profilePath) => {
+      syncCalls.push({ cfg, profilePath })
+      return { ok: true, output: 'verified: 7 models match the gateway' }
+    },
+  })
+
+  const res = await call(route, 'POST', '/provider', {})
+
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+  assert.equal(res.body.created, true)
+  assert.equal(res.body.models.ok, true)
+  assert.equal(syncCalls.length, 1)
+  // 有文件路徑就該傳給腳本，讓它寫回同一個 profile
+  assert.equal(syncCalls[0].profilePath, null)
+})
+
+test('POST /provider：模型同步失敗不算整支失敗，錯誤照實回報', async () => {
+  const editor = fakeEditorWithLlm()
+  const ctx = { get: (name) => (name === 'configEditor' ? editor : undefined), logger: { warn() {} } }
+  const { route } = mount(ctx, {
+    ...baseOptions,
+    syncModels: async () => {
+      throw new Error('proxy is not running')
+    },
+  })
+
+  const res = await call(route, 'POST', '/provider', {})
+
+  assert.equal(res.status, 200)
+  assert.equal(res.body.created, true)
+  assert.equal(res.body.models.ok, false)
+  assert.match(res.body.models.error, /not running/)
+})
+
+test('POST /provider 在沒有 configEditor 時回 503', async () => {
+  const { route } = mount({ logger: { warn() {} } }, { ...baseOptions, syncModels: async () => ({ ok: true }) })
+  const res = await call(route, 'POST', '/provider', {})
+  assert.equal(res.status, 503)
+  assert.match(res.body.error, /configEditor/)
 })

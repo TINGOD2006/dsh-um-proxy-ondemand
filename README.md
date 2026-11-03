@@ -76,6 +76,33 @@ dsh plugin --profile desktop add github:TINGOD2006/dsh-um-proxy-ondemand
         # script: 'C:\Users\you\.um-opencode\um_opencode_setup.py'
 ```
 
+### 模型選單（`um-genai` provider）
+
+外掛**不註冊 provider** —— 它只負責那個代理行程的生死。DSH 模型選單裡的那些 UM 模型，來自內建的 `@deepseek-ai/dsh-llm-pi-ai` 底下的一段 `providers.um-genai` 設定，而那段設定寫在 profile 的 `cordis.patch.yml`，新裝的機器上本來沒有，所以選單會是空的。
+
+補的方法有兩種：
+
+1. **設定頁按鈕（建議）**：DSH 設定 → 外掛 →「UM 代理」→「模型選單（um-genai provider）」那張卡 → 按 **建立 um-genai provider**。它會用 `configEditor` 把 `displayName` / `apiKeyEnv` / `api` / `baseURL` / `models` 寫進 profile patch，接著跑 `scripts/um-models-sync.py --apply` 連本機代理抓 gateway 目前提供的模型 id（代理沒開會自己醒），最後提示你重啟 DSH。
+2. **手動**：把下面這段貼進 profile 的 `cordis.patch.yml`，再跑 `python -B scripts/um-models-sync.py --apply` 補模型清單。
+
+```yaml
+- insert:
+    - id: llm-pi-ai
+      name: "@deepseek-ai/dsh-llm-pi-ai"
+      config:
+        providers:
+          um-genai:
+            displayName: UM GenAI (local proxy)
+            apiKeyEnv: UM_GENAI_API_KEY
+            api: openai-completions
+            baseURL: http://127.0.0.1:8788/v1
+            models: []
+```
+
+`models: []` 只是佔位，`um-models-sync.py --apply` 會把它換成真正的清單（並留下 `.bak-models-<時間>` 備份）。跑完要重啟 DSH，選單才會重讀。
+
+按鈕已經有 provider 時只會補缺的鍵，你手動調過的 `displayName`、埠號、模型子集都不會被蓋掉。
+
 ### 環境變數
 
 | 變數 | 預設 | 作用 |
@@ -184,7 +211,7 @@ health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死�
 | `lib/proxy.js` | 代理生命週期：`healthDetail` / `health` / `ensureProxy`（single-flight） / `stopProxy` / `listeningPids`、狀態檔節流。不依賴 cordis。 |
 | `lib/process.js` | 找 listener／找代理行程／安全終止：只殺認得出是自己那支腳本的行程。 |
 | `lib/index.js` | 事件接線（`llm/stream`）、閒置計時器、唯讀狀態端點、啟動清理與關閉清理。 |
-| `lib/settings-api.js` | 設定頁的後端：`/um-proxy-ondemand/api` 底下的 `/status`、`/settings`、`/account`、`/api-key`，含憑證寫入（走 stdin，不經過命令列）與金鑰儲存。 |
+| `lib/settings-api.js` | 設定頁的後端：`/um-proxy-ondemand/api` 底下的 `/status`、`/settings`、`/account`、`/api-key`、`/provider`，含憑證寫入（走 stdin，不經過命令列）、金鑰儲存，以及寫入 `um-genai` provider 後跑模型同步。 |
 | `lib/client.js` | 設定頁的前端 bundle（手寫的模組載入器格式，只依賴 `react`，沒有建置步驟）。 |
 | `test/ondemand_check.mjs` | 生命週期：冷啟動、沿用、停止、冪等、重複監聽。 |
 | `test/plugin_wiring.mjs` | 用 mock ctx 跑真的 `apply()`：非目標 provider 零成本放行、目標 provider 喚醒並轉送串流。 |
