@@ -22,8 +22,18 @@ headless Chrome）。這個外掛把它改成 **按需喚醒 ＋ 閒置 15 分�
 ### 安裝指令
 
 ```powershell
+dsh plugin --profile desktop add dsh-um-proxy-ondemand
+```
+
+這是首選：從 npm registry 抓發佈快照（目前 `1.4.0`），不必讓 pnpm 從 git 建置，也吃得到 registry 的快取。
+
+想跟 `main` 最新 commit（例如還沒發版的修正）就改用 git 來源：
+
+```powershell
 dsh plugin --profile desktop add github:TINGOD2006/dsh-um-proxy-ondemand
 ```
+
+兩者差別只在版本來源：npm 版是發佈當下的快照，`github:` 版跟著 `main` 走、每次裝都是當下最新的 commit。功能上沒有其他差異，`vendor/um_opencode_setup.py` 兩邊都有。
 
 `dsh plugin` 會把參數原樣轉給 profile 目錄裡的 pnpm，裝好後 `dsh.profile.bundles` 會自動補上這一項。
 裝完重新啟動 DSH（新增設定分頁需要重啟一次，之後改設定不用）。
@@ -37,7 +47,7 @@ dsh plugin --profile desktop add github:TINGOD2006/dsh-um-proxy-ondemand
 
   ```powershell
   cd $env:USERPROFILE\.dsh\profiles\desktop
-  pnpm add github:TINGOD2006/dsh-um-proxy-ondemand --config.minimum-release-age=0
+  pnpm add dsh-um-proxy-ondemand --config.minimum-release-age=0
   ```
 
   再啟動 DSH。
