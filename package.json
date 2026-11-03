@@ -32,6 +32,7 @@
     "scripts/",
     "!scripts/**/__pycache__/",
     "vendor/",
+    "!vendor/**/__pycache__/",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
