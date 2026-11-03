@@ -2,6 +2,14 @@
 # alwaysOn: true → 宿主啟動時主動喚醒、永不閒置關閉、宿主關閉也不會把代理一起帶走；
 # 代理真的掛掉時由看門狗 scripts/um-renew.py（排程每 5 分鐘）補位。
 # 代理的啟動/停止邏輯在 lib/proxy.js；事件接線在 lib/index.js。
+#
+# 這裡刻意只放「每台機器都一樣」的值。python / script / logFile / stateFile
+# 由 lib/paths.js 從環境推導：家目錄取 UM_OPENCODE_HOME 或 ~/.um-opencode，
+# Python 取 PATH 或 %LOCALAPPDATA%\Programs\Python\Python3*，
+# 所以換一台電腦裝起來會自動指向那台電腦的路徑，不必改這個檔案。
+#
+# 要覆寫請寫在你自己的 profile cordis.patch.yml（或用 DSH 的設定頁），
+# 不要改這裡 —— 這個檔案屬於外掛本體，更新外掛時會被覆蓋。
 - insert:
     - id: dsh-um-proxy-ondemand
       name: dsh-um-proxy-ondemand

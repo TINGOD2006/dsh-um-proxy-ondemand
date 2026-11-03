@@ -147,7 +147,7 @@ test('isRecoverableWakeError：只重試自家代理冷啟動逾時', () => {
     ),
     false,
   )
-  assert.equal(isRecoverableWakeError(new Error('spawn C:\\Python314\\pythonw.exe ENOENT')), false)
+  assert.equal(isRecoverableWakeError(new Error('spawn C:\\Tools\\Python312\\pythonw.exe ENOENT')), false)
   assert.equal(isRecoverableWakeError(undefined), false)
 })
 

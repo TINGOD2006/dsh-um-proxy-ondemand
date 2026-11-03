@@ -110,12 +110,14 @@ async function call(route, method, subPath, body) {
   return res
 }
 
+// 刻意不用任何真實路徑：這些測試全部走假的 ctx，不該假設機器上裝了什麼。
+const fakeHome = path.join(os.tmpdir(), 'um-test-home')
 const baseCfg = {
   port: 8788,
-  python: 'C:\\Python314\\pythonw.exe',
-  script: 'C:\\Users\\TINGOD\\.um-opencode\\um_opencode_setup.py',
-  logFile: 'C:\\Users\\TINGOD\\.um-opencode\\proxy.log',
-  stateFile: 'C:\\Users\\TINGOD\\.um-opencode\\ondemand-8788.state.json',
+  python: path.join(fakeHome, 'pythonw.exe'),
+  script: path.join(fakeHome, 'um_opencode_setup.py'),
+  logFile: path.join(fakeHome, 'proxy.log'),
+  stateFile: path.join(fakeHome, 'ondemand-8788.state.json'),
   startupTimeoutMs: 20000,
 }
 
@@ -369,8 +371,8 @@ test('parseSettingsPatch：空白字串＝刪掉覆寫（值是 undefined）', (
 })
 
 test('pythonForCli 把 pythonw.exe 換成 python.exe，其餘原樣', () => {
-  assert.equal(pythonForCli({ python: 'C:\\Python314\\pythonw.exe' }), 'C:\\Python314\\python.exe')
-  assert.equal(pythonForCli({ python: 'C:\\Python314\\python.exe' }), 'C:\\Python314\\python.exe')
+  assert.equal(pythonForCli({ python: 'C:\\Tools\\Python312\\pythonw.exe' }), 'C:\\Tools\\Python312\\python.exe')
+  assert.equal(pythonForCli({ python: 'C:\\Tools\\Python312\\python.exe' }), 'C:\\Tools\\Python312\\python.exe')
   assert.equal(pythonForCli({ python: '/usr/bin/python3' }), '/usr/bin/python3')
   assert.equal(pythonForCli({}), 'python')
 })

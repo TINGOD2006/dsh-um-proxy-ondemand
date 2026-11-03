@@ -7,12 +7,13 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { cfgOf, ensureProxy, stopProxy, healthDetail, readState, writeStateThrottled, clearState, wakeRetryCount } from '../lib/proxy.js'
 import { commandArgs, listenerPids, matchesProxyProcess } from '../lib/process.js'
+import { detectPythonCli } from '../lib/paths.js'
 
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)))
 const close = server => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)) }
 async function freePort() { const s = http.createServer(); const p = await listen(s); await close(s); return p }
 const fixture = fileURLToPath(new URL('./fixtures/proxy.py', import.meta.url))
-const python = process.env.UM_TEST_PYTHON || 'C:\\Python314\\python.exe'
+const python = process.env.UM_TEST_PYTHON || detectPythonCli()
 
 test('health rejects non-200, malformed, truncated and oversized responses', async () => {
   for (const mode of ['503', 'invalid', 'truncated', 'oversized']) {
@@ -55,8 +56,8 @@ test('configuration rejects invalid ports and timer values', () => {
 })
 
 test('ownership requires the interpreter, full script path, serve command and exact port', () => {
-  const cfg = { python: 'C:\\Python314\\pythonw.exe', script: 'C:\\User Space\\proxy.py', port: 4567 }
-  const good = { ExecutablePath: 'C:\\Python314\\python.exe', CommandLine: '"C:\\Python314\\python.exe" -B "C:\\User Space\\proxy.py" serve --port 4567' }
+  const cfg = { python: 'C:\\Tools\\Python312\\pythonw.exe', script: 'C:\\User Space\\proxy.py', port: 4567 }
+  const good = { ExecutablePath: 'C:\\Tools\\Python312\\python.exe', CommandLine: '"C:\\Tools\\Python312\\python.exe" -B "C:\\User Space\\proxy.py" serve --port 4567' }
   assert.equal(matchesProxyProcess(good, cfg), true)
   for (const text of [good.CommandLine.replace('4567','45670'), good.CommandLine.replace('serve','login'), good.CommandLine.replace('User Space','Other Space'), good.CommandLine + ' --port 1']) {
     assert.equal(matchesProxyProcess({ ...good, CommandLine: text }, cfg), false)

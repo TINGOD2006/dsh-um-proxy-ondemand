@@ -9,6 +9,7 @@
  */
 
 import { cfgOf, health, stopProxy } from '../lib/proxy.js'
+import { detectPythonCli } from '../lib/paths.js'
 import * as plugin from '../lib/index.js'
 import http from 'node:http'
 import fs from 'node:fs'
@@ -23,7 +24,7 @@ await new Promise(resolve => probe.close(resolve))
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-always-on-'))
 const cfg = cfgOf({
   port,
-  python: process.env.UM_TEST_PYTHON || 'C:\\Python314\\python.exe',
+  python: process.env.UM_TEST_PYTHON || detectPythonCli(),
   script: fileURLToPath(new URL('./fixtures/proxy.py', import.meta.url)),
   stateFile: path.join(temporary, 'state.json'),
   logFile: path.join(temporary, 'proxy.log'),

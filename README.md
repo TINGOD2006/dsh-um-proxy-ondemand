@@ -6,6 +6,108 @@ DSH 的 `um-genai` provider 指向這個代理；以前它靠一個「登入時�
 的排程工作常駐，即使整天沒用到該模型也一直佔著一個 Python 行程（以及它自己的
 headless Chrome）。這個外掛把它改成 **按需喚醒 ＋ 閒置 15 分鐘自動關閉**。
 
+## 安裝
+
+### 前置條件
+
+| 需要 | 說明 |
+| --- | --- |
+| **UM 帳號** | 本外掛服務的是澳門大學的 GenAI 校園 gateway（`https://chat.genai.um.edu.mo`）。沒有 UM 帳號就沒有東西可以代理。 |
+| **`um_opencode_setup.py`** | **這是本外掛唯一的硬性依賴，而它不在本 repo 裡。** 代理本體（OpenAI 相容的本機服務）由 UM 校內安裝流程放到 `~/.um-opencode/um_opencode_setup.py`。沒有這個檔案，外掛裝得起來但只會回報「找不到腳本」，不會有任何代理行為。 |
+| **Node.js 22 以上** | 宿主本身的需求；跑本 repo 的測試要 24（用到實驗性的 module mock）。 |
+| **Python 3.10 以上** | 建議 3.12。Windows 安裝時勾 **Add python.exe to PATH**，或稍後在設定頁直接填絕對路徑。 |
+
+> 外掛**不是**模型、不產生 token、不代理其他 provider。它管的只有一件事：那個本機代理行程的生死。
+
+### 安裝
+
+```powershell
+dsh plugin --profile desktop add github:TINGOD2006/dsh-um-proxy-ondemand
+```
+
+`dsh plugin` 會把參數原樣轉給 profile 目錄裡的 pnpm，裝好後 `dsh.profile.bundles` 會自動補上這一項。
+裝完重新啟動 DSH（新增設定分頁需要重啟一次，之後改設定不用）。
+
+兩個常見的卡點：
+
+- **要用桌面版內建的 `dsh`。** 桌面版的 profile 由 Electron 獨佔，npm 全域那份會直接拒絕：
+  `error: profile "desktop" is managed exclusively by the Electron application`。
+  確認 `Get-Command dsh` 第一個是 `...\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd`。
+- **檔案被佔用導致換不上**（DSH 正開著、pnpm 拿不到檔案鎖）。完全退出 DSH，然後在 profile 目錄手動裝：
+
+  ```powershell
+  cd $env:USERPROFILE\.dsh\profiles\desktop
+  pnpm add github:TINGOD2006/dsh-um-proxy-ondemand --config.minimum-release-age=0
+  ```
+
+  再啟動 DSH。
+
+### 第一次設定
+
+外掛啟動時會自己推導預設值，多數情況不必填任何東西：
+
+- **家目錄**：`UM_OPENCODE_HOME` 有設就用它，否則 `~/.um-opencode`。
+- **Python**：`UM_PYTHON` → `%LOCALAPPDATA%\Programs\Python\Python3*`（取版本最高）→ `C:\Python3*` → `PATH` 上的 `pythonw.exe`。
+- **代理腳本／日誌／狀態檔**：都在家目錄下，狀態檔帶埠號（`ondemand-8788.state.json`）。
+
+要覆寫就到 **DSH 設定 → 外掛 → 「UM 代理」** 分頁，那裡有狀態列、一般設定（埠號、常駐模式、閒置分鐘、啟動逾時、Python 路徑、腳本路徑、日誌、狀態檔）、UM 帳號（寫入 `um_opencode_setup.py set-credentials`，密碼不經過命令列）、代理金鑰（`UM_GENAI_API_KEY`）。
+
+同樣的值也可以直接寫進 profile 的 `cordis.patch.yml`：
+
+```yaml
+- insert:
+    - id: dsh-um-proxy-ondemand
+      name: dsh-um-proxy-ondemand
+      config:
+        port: 8788
+        alwaysOn: true
+        # python: 'C:\Users\you\AppData\Local\Programs\Python\Python312\pythonw.exe'
+        # script: 'C:\Users\you\.um-opencode\um_opencode_setup.py'
+```
+
+### 環境變數
+
+| 變數 | 預設 | 作用 |
+| --- | --- | --- |
+| `UM_OPENCODE_HOME` | `~/.um-opencode` | 代理腳本、日誌、狀態檔、續期看門狗紀錄的家目錄。JS 與 Python 兩邊共用同一條規則。 |
+| `UM_PYTHON` | 自動偵測 | 明確指定 Python 解譯器；設了就跳過偵測。 |
+| `UM_UPSTREAM_BASE` | `https://chat.genai.um.edu.mo` | 上游 gateway。換校區或測試環境才需要改。 |
+| `UM_HIDDEN_LOGIN` | `1` | 設 `0` 可關掉「隱藏桌面登入」，回到會彈出可見視窗的舊行為。 |
+| `UM_TEST_PYTHON` | — | 只影響測試，不影響正式代理。 |
+
+### 驗證裝好了
+
+```powershell
+# 代理本身（要先被喚醒過一次；alwaysOn: true 的話 DSH 一開就有）
+curl http://127.0.0.1:8788/health
+# {"status":"ok","service":"um-opencode-proxy"}
+
+# 外掛自己（把埠換成你 DSH 的 GUI 埠）
+curl http://127.0.0.1:<GUI埠>/um-proxy-ondemand/api/status
+```
+
+設定頁的「狀態」區塊看得到同樣的資訊：`running`、`pid`、`alwaysOn`、`idleTimerArmed`、請求數與喚醒數。實際用法是回 DSH 選一個 `um-genai` 的模型送一句話——第一次會冷啟動（幾秒），之後走熱路徑。
+
+### 常見錯誤
+
+| 症狀 | 原因 | 處理 |
+| --- | --- | --- |
+| 設定頁顯示「找不到腳本」 | `~/.um-opencode/um_opencode_setup.py` 不存在 | 先跑 UM 的校內安裝流程；或把 `UM_OPENCODE_HOME` / 設定頁的「腳本路徑」指到正確位置 |
+| 冷啟動失敗，日誌有 `ENOENT` | Python 路徑不對 | 在設定頁填 `pythonw.exe` 的絕對路徑，或設 `UM_PYTHON` |
+| 回 401 | 上游 UM 登入 token 過期（不是 API key 錯） | 跑 `python scripts/um-recover.ps1 -Fix`，或等續期看門狗；詳見下方〈反代 401〉一節 |
+| 埠被佔用 | 8788 上已經有別的行程在聽 | 設定頁改 `port`，或先找出佔用者；外掛不會殺不屬於自己的行程 |
+| 設定頁整頁空白 | 分頁沒註冊成功（少見） | 重啟 DSH；仍空白就查 `~/.dsh/profiles/desktop` 的 log |
+
+### 移除
+
+```powershell
+dsh plugin --profile desktop remove dsh-um-proxy-ondemand
+```
+
+移除只拿掉外掛本身。已經在跑的代理行程不會被帶走（`alwaysOn: true` 的設計就是不讓 DSH 的生命週期管它），
+要一起收掉就 `python ~/.um-opencode/um_opencode_setup.py stop`；排程工作（如果建過）用
+`schtasks /Delete /TN "\UMGenAIProxy-Renew" /F` 清掉。
+
 ## 它怎麼運作
 
 ```
@@ -52,7 +154,7 @@ DSH 關閉 → 順手關掉代理（不留孤兒行程）
 其餘刻意**不做**的取捨：`/health` 用 keep-alive agent 實測沒有增益（0.25 對 0.25ms）；
 health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死掉會讓請求直接失敗而不是自動冷啟動，不值得。
 
-另外，`C:\Python314\python.exe` 的直譯器啟動就佔了冷喚醒的大半——那是代理本身的成本，外掛只能把「其實已經好了卻還在等」的空窗拿掉。
+另外，`python` 的直譯器啟動就佔了冷喚醒的大半——那是代理本身的成本，外掛只能把「其實已經好了卻還在等」的空窗拿掉。
 
 ## 檔案
 
@@ -74,7 +176,7 @@ health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死�
 執行測試（前三支會實際啟停 8788 代理）：
 
 ```powershell
-cd C:\Users\TINGOD\Documents\deepseek-harness\default-workspace\dsh-um-proxy-ondemand
+cd <本 repo 目錄>
 node test/efficiency_unit.mjs   # 安全：不碰 8788
 node test/ondemand_check.mjs
 node test/plugin_wiring.mjs
@@ -159,7 +261,7 @@ profile 被一個**沒有開 debug port** 的 Chrome 實例佔住，新開的 Ch
 **一鍵診斷／修復**（`scripts\um-recover.ps1`，Windows PowerShell 5.1 即可）：
 
 ```powershell
-cd C:\Users\TINGOD\Documents\deepseek-harness\default-workspace\dsh-um-proxy-ondemand
+cd <本 repo 目錄>
 
 # 只診斷，不動任何東西
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1
@@ -180,9 +282,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix
 結束碼：`0` 可用／已修好、`2` 需要人工處理、`3` 代理沒在跑、`4` 環境錯誤。
 
 - 登入成功後代理**不用重啟**，下一個請求就會拿到新 token（log 會出現 `token renewed on demand.`）。
-- 手動等價指令：`C:\Python314\python.exe C:\Users\TINGOD\.um-opencode\um_opencode_setup.py login --timeout 170`
+- 手動等價指令：`python %USERPROFILE%\.um-opencode\um_opencode_setup.py login --timeout 170`
   （`login` 不吃 `--port`）。
-- 若在 DSH 的受限沙箱裡跑，login 會死在 `os.chmod('C:\Users\TINGOD\.um-opencode')`
+- 若在 DSH 的受限沙箱裡跑，login 會死在 `os.chmod('%USERPROFILE%\.um-opencode')`
   → `PermissionError: [WinError 5]`；請在一般 PowerShell／cmd 視窗執行。
 - 想根治：登入後把那個 UM 登入視窗留著（有 debug port 可重複用）或完全關掉再讓它靜默續期；
   最怕的是「活著但沒有 debug port」的殘留 Chrome。
@@ -283,19 +385,19 @@ login      : hidden desktop (UM_HIDDEN_LOGIN)
 `--status` 的 `login` 那行會顯示目前是 `hidden desktop` 還是 `visible window`。隱藏桌面只是把視窗
 移出你的螢幕，沒有繞過任何驗證：該按的 Duo 核准還是要按。
 
-檔案位置（都在 `C:\Users\TINGOD\.um-opencode\`）：`renew-watchdog.log`（每次判斷與結果）、
+檔案位置（都在 `%USERPROFILE%\.um-opencode\`）：`renew-watchdog.log`（每次判斷與結果）、
 `renew-watchdog.lock`、`renew-watchdog.last-fail`、`renew-watchdog.last-success`（上次續期成功的時刻）、
 `renew-watchdog.visible-prompt`（上次彈出可見視窗的時刻）、`hidden-window.pid`、`browser-debug-port`。
 
 ```powershell
 # 只看狀態，不動任何東西
-C:\Python314\python.exe -B scripts\um-renew.py --status
+python -B scripts\um-renew.py --status
 
 # 問 gateway 這個 token 還算不算數（exit 0 接受 / 2 被拒 / 3 連不上）
-C:\Python314\python.exe -B scripts\um-renew.py --probe
+python -B scripts\um-renew.py --probe
 
 # 立刻續期一次（不必等排程）
-C:\Python314\python.exe -B scripts\um-renew.py --force
+python -B scripts\um-renew.py --force
 ```
 
 排程工作 `\UMGenAIProxy-Renew`（已建立，每 5 分鐘、只在目前使用者登入時執行）：
@@ -311,7 +413,7 @@ schtasks /Delete /TN "\UMGenAIProxy-Renew" /F            # 完全移除
 
 ```powershell
 schtasks /Create /TN "\UMGenAIProxy-Renew" /SC MINUTE /MO 5 /F `
-  /TR '"C:\Python314\pythonw.exe" -B "C:\Users\TINGOD\Documents\deepseek-harness\default-workspace\dsh-um-proxy-ondemand\scripts\um-renew.py"'
+  /TR '"pythonw" -B "%USERPROFILE%\<本 repo 目錄>\scripts\um-renew.py"'
 ```
 
 `login` 成功後代理**不用重啟**，下一個請求就會用新 token；Duo 若跳出核准，看門狗會自動點
@@ -337,7 +439,7 @@ POST /v1/chat/completions {"model":"DeepSeek-V4.1-Flash-1017"} → HTTP 200
 其他設定（baseURL、apiKeyEnv、其他 provider）原封不動，改之前先備份成 `<檔名>.bak-models-<時間>`：
 
 ```powershell
-cd C:\Users\TINGOD\Documents\deepseek-harness\default-workspace\dsh-um-proxy-ondemand
+cd <本 repo 目錄>
 
 npm run um:models          # 只看有沒有漂移（唯讀）
 npm run um:models:apply    # 有漂移就改寫 profile 與 opencode.json
@@ -464,7 +566,7 @@ curl.exe -s -H "Authorization: Bearer $key" "http://127.0.0.1:8788/diagnostics?p
   schtasks /Change /TN "\UMGenAIProxy" /ENABLE            # 要改回常駐就開這個
   ```
   停用前它每天約啟動 720 次 python（每次都在 bind 失敗後退出），也讓「閒置自動關閉」失去意義。
-- `C:\Users\TINGOD\.um-opencode\proxy.pid` 是 8787／8788 共用的舊 pid 檔；排程停用後它會停在最後
+- `%USERPROFILE%\.um-opencode\proxy.pid` 是 8787／8788 共用的舊 pid 檔；排程停用後它會停在最後
   一個死 pid。本外掛刻意不讀它，只用 `ondemand-8788.state.json`。
 - **OpenCode 直連 8788**：`~\.um-opencode\opencode.json` 的 `baseURL` 是 `http://127.0.0.1:8788/v1`。
   DSH 的按需喚醒只在 DSH 發請求時生效；若你單獨開 OpenCode 而代理正好閒置關閉，OpenCode 會連不上
@@ -473,17 +575,17 @@ curl.exe -s -H "Authorization: Bearer $key" "http://127.0.0.1:8788/diagnostics?p
 ## 回復方式
 
 1. 把外掛從 profile 拿掉：
-   - `C:\Users\TINGOD\.dsh\profiles\desktop\package.json` 刪掉 `dependencies` 的
+   - `%USERPROFILE%\.dsh\profiles\desktop\package.json` 刪掉 `dependencies` 的
      `dsh-um-proxy-ondemand` 與 `dsh.bundle.bundles` 的同一項
      （備份：同目錄 `package.json.bak-before-ondemand-*`）。
-   - 刪除 `C:\Users\TINGOD\.dsh\profiles\desktop\node_modules\dsh-um-proxy-ondemand`
+   - 刪除 `%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-um-proxy-ondemand`
      （目錄連結）。
 2. 還原常駐排程（排程只是被停用，直接啟用即可；若已被刪除才需要重建）：
    ```powershell
    schtasks /Change /TN "\UMGenAIProxy" /ENABLE
    # 或從匯出的 XML 重建：
    schtasks /Create /TN "\UMGenAIProxy" /XML `
-     "C:\Users\TINGOD\Documents\deepseek-harness\default-workspace\cmd_popup_diagnosis\um-proxy-task-export.xml"
+     "<你匯出的 um-proxy-task-export.xml>"
    ```
 
 ## 穩定性硬化（2026-10-25 第三輪）
@@ -504,16 +606,16 @@ Chrome 佔住私有 profile 卻沒有 debug port，續期每次都 `auto-login s
 用法：
 
 ```powershell
-python C:\Users\TINGOD\Documents\deepseek-harness\default-workspace\dsh-um-proxy-ondemand\scripts\um-health.py
-python C:\Users\TINGOD\.um-opencode\um_opencode_setup.py status     # 自動認 8788
-python C:\Python314\python.exe -C "import py_compile; py_compile.compile(r'C:\Users\TINGOD\.um-opencode\um_opencode_setup.py', doraise=True)"
+python scripts\um-health.py
+python %USERPROFILE%\.um-opencode\um_opencode_setup.py status     # 自動認 8788
+python -C "import py_compile; py_compile.compile(r'%USERPROFILE%\.um-opencode\um_opencode_setup.py', doraise=True)"
 ```
 
 `proxy.build` 對不上時，重啟代理讓它載入新檔：
 
 ```powershell
-python C:\Users\TINGOD\.um-opencode\um_opencode_setup.py stop
-python C:\Python314\python.exe -B C:\Users\TINGOD\.um-opencode\um_opencode_setup.py serve --port 8788 --ignore-console-events --log-file C:\Users\TINGOD\.um-opencode\proxy.log
+python %USERPROFILE%\.um-opencode\um_opencode_setup.py stop
+python -B %USERPROFILE%\.um-opencode\um_opencode_setup.py serve --port 8788 --ignore-console-events --log-file %USERPROFILE%\.um-opencode\proxy.log
 ```
 
 
@@ -564,7 +666,7 @@ token 有效時排程本體 372 ms 靜默結束；`um-health.py` 的 `gateway ac
 npm test
 ```
 
-需要 Node.js 24（外掛接線測試使用實驗性的 module mock）與 `C:\Python314\python.exe`。
+需要 Node.js 24（外掛接線測試使用實驗性的 module mock）與 `python`。
 `npm test` 不啟停正式 8788、不開真實登入瀏覽器、不讀真實憑證：生命週期測試在隨機回環埠啟停 `test/fixtures/proxy.py`，其餘登入／排程／設定檔故障由 mock 與暫存檔驗證。自訂測試 Python 可設定 `UM_TEST_PYTHON`；這不改變正式代理的 Python 設定。
 
 本輪部署後須重啟 DSH host 才會重新載入 JS；排程腳本於下次排程執行時載入新碼。這裡的自動化測試不等於已完成真實 DSH 對話或 Duo 登入驗證。
@@ -643,5 +745,31 @@ npm test
 `StalePidFile`（4 支）蓋住這兩條路徑與 `--status` 的兩種情況。
 
 驗證：Python 全套 **57 支**全綠（`hidden_window_stability` 19、`scripts_stability` 19、`renew_stability` 19）。
+
+## 給貢獻者
+
+```powershell
+npm test
+```
+
+`npm test` 依序跑五組：
+
+| 指令 | 內容 | 碰得到 8788 嗎 |
+| --- | --- | --- |
+| `npm run test:unit` | 純單元：single-flight、輪詢排程、狀態檔節流、`healthDetail` 判定 | 不會 |
+| `npm run test:always-on` | 常駐模式 9 項（啟動即喚醒、閒置不關、狀態端點、卸載不帶走代理） | 隨機回環埠 |
+| `npm run test:stability` | `proxy_stability` ＋ `plugin_stability`（後者要 `--experimental-test-module-mocks`） | 隨機回環埠 |
+| `npm run test:settings` | 設定頁 API（`lib/settings-api.js`） | 不會 |
+| `npm run test:scripts` | Python 全套 `*stability.py` | 不會 |
+
+幾個約定：
+
+- **要 Node.js 24** 跑測試（`plugin_stability` 用實驗性的 module mock）；外掛本身在 22 以上就行。
+- **`UM_TEST_PYTHON`** 指定測試用的 Python；不影響正式代理用的那一個。沒設就自動偵測。
+- 生命週期測試在隨機回環埠啟停 `test/fixtures/proxy.py`，不會動到正式 8788，也不會開真實登入瀏覽器或讀真實憑證。
+- 單跑一支：`node test/always_on.mjs`、`node test/efficiency_unit.mjs`、`python -m unittest test.hidden_window_stability` 之類。
+- **不要 commit 本機化設定。** `cordis.patch.yml` 必須保持通用值（只有 `port` 與 `alwaysOn`）；`package.json` 的 python 指令不要寫死某台機器的路徑。個人路徑請留在**你自己 profile** 的 `cordis.patch.yml` 或設定頁裡——那裡本來就是拿來覆寫的。同理，README 裡的範例路徑請用 `%USERPROFILE%` 或 `<本 repo 目錄>`，不要貼自己的絕對路徑。
+- 改 `lib/client.js` 不需要建置步驟（手寫的模組載入器格式），存檔後重新整理頁面就生效；**新增**設定分頁才要重啟 DSH。
+- 行為改動請附一支釘住它的回歸測試。這個 repo 的既有慣例是「測試名稱直接說明它防的是哪個事故」。
 
 

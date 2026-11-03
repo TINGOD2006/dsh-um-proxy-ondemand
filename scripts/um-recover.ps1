@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     UM GenAI 本機反代（127.0.0.1:8788）一鍵診斷／修復。
@@ -28,7 +28,7 @@
     診斷，必要時自動重新登入。
 
 .NOTES
-    在 DSH 的受限沙箱裡執行時，login 會因為要寫入 C:\Users\TINGOD\.um-opencode
+    在 DSH 的受限沙箱裡執行時，login 會因為要寫入 ~\.um-opencode
     而被系統拒絕（PermissionError: [WinError 5]）。請在一般 PowerShell / cmd 視窗執行。
 
     結束碼：0 = 可用（或已修好）、2 = 需要人工處理、3 = 代理沒在跑、4 = 環境／其他錯誤。
@@ -60,7 +60,20 @@ function Write-Info([string]$text) { Write-Host "       $text" -ForegroundColor 
 function Write-Cmd([string]$text)  { Write-Host "  -> $text" -ForegroundColor White }
 
 function Resolve-Python {
-  foreach ($candidate in @('C:\Python314\python.exe', 'C:\Python314\pythonw.exe')) {
+  # 先找「使用者範圍安裝」的最新 Python，再退回全機安裝，最後才靠 PATH。
+  # 不寫死版本號與使用者名稱：別人的機器不會剛好也是 Python 3.12 或 C:\Python314。
+  $candidates = @()
+  if ($env:UM_PYTHON) { $candidates += $env:UM_PYTHON }
+  $roots = @()
+  if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA 'Programs\Python') }
+  $roots += 'C:\'
+  foreach ($root in $roots) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+    $candidates += @(Get-ChildItem -LiteralPath $root -Directory -Filter 'Python3*' -ErrorAction SilentlyContinue |
+      Sort-Object Name -Descending |
+      ForEach-Object { Join-Path $_.FullName 'python.exe'; Join-Path $_.FullName 'pythonw.exe' })
+  }
+  foreach ($candidate in $candidates) {
     if (Test-Path -LiteralPath $candidate) { return $candidate }
   }
   $cmd = Get-Command python -ErrorAction SilentlyContinue
@@ -123,7 +136,7 @@ if (-not (Test-Path -LiteralPath $setup)) {
 
 $python = Resolve-Python
 if (-not $python) {
-  Write-Bad '找不到 python.exe（預期 C:\Python314\python.exe）'
+  Write-Bad '找不到 python.exe：請安裝 Python 3.10+ 並勾選 Add to PATH，或用 UM_PYTHON 環境變數指定路徑'
   exit 4
 }
 

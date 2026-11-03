@@ -17,7 +17,7 @@ minutes; it decides from two independent signals:
 
 Renewal runs the auto-login script:
 
-    C:\\Python314\\python.exe C:\\Users\\TINGOD\\.um-opencode\\um_opencode_setup.py login --timeout 120
+    python -B ~/.um-opencode/um_opencode_setup.py login --timeout 120
 
 A login is only reported as successful when the fresh token is accepted by the
 gateway. If a leftover Chrome window owns the private profile without exposing a
