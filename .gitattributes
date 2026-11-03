@@ -1,0 +1,2 @@
+# 代理腳本以 LF 存放：它是 UM 發放的原檔，雜湊要能對得上 vendor/README.md 記的值。
+vendor/um_opencode_setup.py text eol=lf
