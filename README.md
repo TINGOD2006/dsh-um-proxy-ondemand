@@ -770,7 +770,7 @@ npm test
 
 | 指令 | 內容 | 碰得到 8788 嗎 |
 | --- | --- | --- |
-| `npm run test:unit` | 純單元，兩支：`efficiency_unit`（single-flight、輪詢排程、狀態檔節流、`healthDetail` 判定）＋ `paths_unit`（家目錄與四個路徑推導、Python 偵測順序、`defaultsOf` 不含作者機器的路徑） | 不會 |
+| `npm run test:unit` | 純單元，兩支：`efficiency_unit`（single-flight、輪詢排程、狀態檔節流、`healthDetail` 判定）＋ `paths_unit`（家目錄與四個路徑推導、Python 偵測順序、`defaultsOf` 不含作者機器的路徑、`resolveScript` 的家目錄／`vendor/` 順序） | 不會 |
 | `npm run test:always-on` | 常駐模式 9 項（啟動即喚醒、閒置不關、狀態端點、卸載不帶走代理） | 隨機回環埠 |
 | `npm run test:stability` | `proxy_stability` ＋ `plugin_stability`（後者要 `--experimental-test-module-mocks`） | 隨機回環埠 |
 | `npm run test:settings` | 設定頁 API（`lib/settings-api.js`） | 不會 |
@@ -785,6 +785,7 @@ npm test
 - **不要 commit 本機化設定。** `cordis.patch.yml` 必須保持通用值（只有 `port` 與 `alwaysOn`）；`package.json` 的 python 指令不要寫死某台機器的路徑。個人路徑請留在**你自己 profile** 的 `cordis.patch.yml` 或設定頁裡——那裡本來就是拿來覆寫的。同理，README 裡的範例路徑請用 `%USERPROFILE%` 或 `<本 repo 目錄>`，不要貼自己的絕對路徑。
 - 改 `lib/client.js` 不需要建置步驟（手寫的模組載入器格式），存檔後重新整理頁面就生效；**新增**設定分頁才要重啟 DSH。
 - 行為改動請附一支釘住它的回歸測試。這個 repo 的既有慣例是「測試名稱直接說明它防的是哪個事故」。
+- **換掉 `vendor/um_opencode_setup.py`** 時：同時更新 `vendor/README.md` 的大小、行數與 sha256 前 16 碼（`git show HEAD:vendor/um_opencode_setup.py | sha256sum`），並保留 `.gitattributes` 的 `text eol=lf`——換行被轉成 CRLF，雜湊就對不上了。`npm run test:unit` 只驗證副本存在、開頭是代理腳本；雜湊要靠上面那行手動核對。
 
 ## 授權
 
