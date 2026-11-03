@@ -30,6 +30,7 @@
   "files": [
     "lib/",
     "scripts/",
+    "!scripts/**/__pycache__/",
     "vendor/",
     "cordis.patch.yml",
     "README.md",
