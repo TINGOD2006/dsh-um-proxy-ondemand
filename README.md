@@ -13,11 +13,11 @@ headless Chrome）。這個外掛把它改成 **按需喚醒 ＋ 閒置 15 分�
 | 需要 | 說明 |
 | --- | --- |
 | **UM 帳號** | 本外掛服務的是澳門大學的 GenAI 校園 gateway（`https://chat.genai.um.edu.mo`）。沒有 UM 帳號就沒有東西可以代理。 |
-| **`um_opencode_setup.py`** | **這是本外掛唯一的硬性依賴，而它不在本 repo 裡。** 代理本體（OpenAI 相容的本機服務）由 UM 校內安裝流程放到 `~/.um-opencode/um_opencode_setup.py`。沒有這個檔案，外掛裝得起來但只會回報「找不到腳本」，不會有任何代理行為。 |
+| **`um_opencode_setup.py`** | 代理本體（OpenAI 相容的本機服務），UM 校內發放的單檔工具。**外掛自帶一份在 [`vendor/um_opencode_setup.py`](vendor/um_opencode_setup.py)**，所以乾淨的機器裝完就能直接跑。`~/.um-opencode/` 那份優先（你自己更新過、或 UM 發了新版就以它為準），家目錄沒有才退回自帶副本；**只有在兩邊都沒有時才會失敗**。 |
 | **Node.js 22 以上** | 宿主本身的需求；跑本 repo 的測試要 24（用到實驗性的 module mock）。 |
 | **Python 3.10 以上** | 建議 3.12。Windows 安裝時勾 **Add python.exe to PATH**，或稍後在設定頁直接填絕對路徑。 |
 
-> 外掛**不是**模型、不產生 token、不代理其他 provider。它管的只有一件事：那個本機代理行程的生死。
+> 外掛**不是**模型、不產生 token、不代理其他 provider。它管的只有一件事：那個本機代理行程的生死。代理本體是 UM 發放的 `um_opencode_setup.py`，本 repo 只附一份原封不動的副本（見 [`vendor/`](vendor/)）。
 
 ### 安裝指令
 
@@ -48,7 +48,8 @@ dsh plugin --profile desktop add github:TINGOD2006/dsh-um-proxy-ondemand
 
 - **家目錄**：`UM_OPENCODE_HOME` 有設就用它，否則 `~/.um-opencode`。
 - **Python**：`UM_PYTHON` → `%LOCALAPPDATA%\Programs\Python\Python3*`（取版本最高）→ `C:\Python3*` → `PATH` 上的 `pythonw.exe`。
-- **代理腳本／日誌／狀態檔**：都在家目錄下，狀態檔帶埠號（`ondemand-8788.state.json`）。
+- **代理腳本**：`~/.um-opencode/um_opencode_setup.py` 優先，沒有才用外掛自帶的 `vendor/um_opencode_setup.py`（`lib/paths.js` 的 `resolveScript()`）。
+- **日誌／狀態檔**：都在家目錄下，狀態檔帶埠號（`ondemand-8788.state.json`）。腳本自己的資料（token、`credentials.dat`、`proxy.log`）一律寫在家目錄，不會寫進外掛目錄。
 
 要覆寫就到 **DSH 設定 → 外掛 → 「UM 代理」** 分頁，那裡有狀態列、一般設定（埠號、常駐模式、閒置分鐘、啟動逾時、Python 路徑、腳本路徑、日誌、狀態檔）、UM 帳號（寫入 `um_opencode_setup.py set-credentials`，密碼不經過命令列）、代理金鑰（`UM_GENAI_API_KEY`）。
 
@@ -95,8 +96,8 @@ curl.exe http://127.0.0.1:<GUI埠>/um-proxy-ondemand/api/status
 
 | 症狀 | 原因 | 處理 |
 | --- | --- | --- |
-| 設定頁顯示「找不到腳本」 | `~/.um-opencode/um_opencode_setup.py` 不存在 | 先跑 UM 的校內安裝流程；或把 `UM_OPENCODE_HOME` / 設定頁的「腳本路徑」指到正確位置 |
-| 喚醒失敗，錯誤訊息是 `proxy script not found: <路徑> — this file is not part of the plugin` | 同上：外掛找不到代理腳本，所以連 spawn 都沒發生 | 這句是外掛自己給的（不是 Python 的 `can't open file`）。把它指到正確的 `um_opencode_setup.py`，或設 `UM_OPENCODE_HOME`。狀態端點會回報 `host.script: { path, exists: false }`，設定頁狀態區塊同時顯示紅字警告 |
+| 設定頁顯示「找不到腳本」 | `~/.um-opencode/um_opencode_setup.py` 不存在，**而且**外掛自帶的 `vendor/um_opencode_setup.py` 也不在（例如只裝了 `lib/`、或有人刪掉了 `vendor/`） | 通常不必處理——自帶副本會接手。真的兩邊都沒有時：重裝外掛補回 `vendor/`，或把 `UM_OPENCODE_HOME` / 設定頁的「腳本路徑」指到正確位置 |
+| 喚醒失敗，錯誤訊息是 `proxy script not found: <路徑> — this file is not part of the plugin` | 家目錄與 `vendor/` 都沒有代理腳本，所以連 spawn 都沒發生。正常安裝下不該出現 | 這句是外掛自己給的（不是 Python 的 `can't open file`）。重裝外掛取回 `vendor/` 副本，或把腳本放到那個路徑、設 `UM_OPENCODE_HOME`。狀態端點會回報 `host.script: { path, exists: false }`，設定頁狀態區塊同時顯示紅字警告 |
 | 冷啟動失敗，日誌有 `ENOENT` | Python 路徑不對 | 在設定頁填 `pythonw.exe` 的絕對路徑，或設 `UM_PYTHON` |
 | 回 401 | 上游 UM 登入 token 過期（不是 API key 錯） | 跑 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\um-recover.ps1 -Fix`，或等續期看門狗；詳見下方〈反代 401〉一節 |
 | 埠被佔用 | 8788 上已經有別的行程在聽 | 設定頁改 `port`，或先找出佔用者；外掛不會殺不屬於自己的行程 |
@@ -142,7 +143,8 @@ DSH 關閉 → 順手關掉代理（不留孤兒行程）
 | 停止時檢查所有監聽者，只終止確認屬於此代理者 | 每個 PID 都須符合 Python 路徑、完整腳本路徑、`serve` 與埠號；外來服務會保留並回報停止未完成。 |
 | 不以 `state.pid` 作為終止依據 | Windows 會回收 PID。netstat 或 CIM 無法確認時會回報失敗，不退回舊狀態檔猜測。 |
 | 冷啟動時 `detached + windowsHide`，對象是 `pythonw.exe` | GUI 子系統 ＋ `DETACHED_PROCESS` ⇒ 不產生任何主控台視窗（已實測，見下）。 |
-| spawn 前先檢查代理腳本存在 | 腳本不在外掛裡，第一次安裝最常見的失敗就是它。自己先報 `proxy script not found: <路徑>` 比讓使用者去讀 Python 的 `can't open file` 或一句 `did not become healthy` 有用得多。 |
+| 家目錄那份腳本優先，`vendor/` 只是後備 | 使用者可能自己更新過那份工具，或 UM 發了新版；自帶副本只負責讓乾淨的機器能直接跑。反過來（自帶優先）會讓使用者的更新被悄悄忽略。 |
+| spawn 前先檢查代理腳本存在 | 家目錄與 `vendor/` 都沒有時（例如只裝了 `lib/`、或有人刪掉 `vendor/`），自己先報 `proxy script not found: <路徑>` 比讓使用者去讀 Python 的 `can't open file` 或一句 `did not become healthy` 有用得多。 |
 
 ## 效率：熱路徑與喚醒延遲
 
@@ -167,7 +169,7 @@ health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死�
 | --- | --- |
 | `package.json` | DSH bundle 契約（`type: module`、`exports`、`dsh.bundle.patch`）。 |
 | `cordis.patch.yml` | 插入條目與「每台機器都一樣」的設定（`port: 8788`、`alwaysOn: true`）。個人路徑不要寫在這裡。 |
-| `lib/paths.js` | 可移植的預設值：`homeDir` / `scriptPath` / `logPath` / `statePath` / `detectPython` / `defaultsOf`。從 `UM_OPENCODE_HOME`、`UM_PYTHON`、`%LOCALAPPDATA%`、`PATH` 推導，不寫死任何一台機器的路徑。 |
+| `lib/paths.js` | 可移植的預設值：`homeDir` / `scriptPath` / `bundledScriptPath` / `resolveScript` / `logPath` / `statePath` / `detectPython` / `defaultsOf`。從 `UM_OPENCODE_HOME`、`UM_PYTHON`、`%LOCALAPPDATA%`、`PATH` 推導，不寫死任何一台機器的路徑。 |
 | `lib/proxy.js` | 代理生命週期：`healthDetail` / `health` / `ensureProxy`（single-flight） / `stopProxy` / `listeningPids`、狀態檔節流。不依賴 cordis。 |
 | `lib/process.js` | 找 listener／找代理行程／安全終止：只殺認得出是自己那支腳本的行程。 |
 | `lib/index.js` | 事件接線（`llm/stream`）、閒置計時器、唯讀狀態端點、啟動清理與關閉清理。 |
@@ -178,7 +180,9 @@ health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死�
 | `test/idle_timeout.mjs` | 閒置自動關閉（用 `idleSeconds: 3` 壓縮週期）。 |
 | `test/coldstart.mjs` | 冷啟動計時，供無視窗驗證使用。 |
 | `test/efficiency_unit.mjs` | 純單元測試（不寫檔、不起代理）：single-flight、輪詢排程、狀態檔節流、`healthDetail` 判定。 |
-| `test/paths_unit.mjs` | 純單元測試：家目錄與四個路徑的推導、Python 偵測順序、`defaultsOf` 不含作者機器的路徑。 |
+| `test/paths_unit.mjs` | 純單元測試：家目錄與四個路徑的推導、Python 偵測順序、`defaultsOf` 不含作者機器的路徑、`resolveScript` 的「家目錄優先、`vendor/` 後備」順序。 |
+| `vendor/um_opencode_setup.py` | UM 校內發放的單檔工具（安裝器＋本機代理＋診斷），原封不動放進來當後備，讓乾淨的機器裝完就能跑。著作權屬原發放單位。 |
+| `vendor/README.md` | 那份副本的來源、載入順序、更新方式（含 sha256 前 16 碼 `1b4555a48a999254`）與授權說明。 |
 | `scripts/um-recover.ps1` | 反代自救腳本：診斷 401（上游 UM token 過期 vs `local-api-key` 不對），可 `-Fix` 自動重新登入。 |
 | `scripts/um-renew.py` | 續期看門狗（獨立於代理）：每 5 分鐘檢查 JWT `exp`、**距上次成功續期的時間**和 gateway 是否真的接受 token，需要時自動跑 `login`、清掉殘留的登入 Chrome、先把登入瀏覽器放到隱藏桌面，並在續期後實測新 token。 |
 | `scripts/um_hidden_window.py` | 把登入用的 Chrome 開在私有的 Win32 桌面上（使用者看不到，但渲染與 DevTools 照常），並把它的 debug 埠發佈到 `browser-debug-port`；可 `--status`／`--ensure`／`--close`／`--probe`。 |
@@ -784,6 +788,8 @@ npm test
 
 ## 授權
 
-MIT，見 [LICENSE](LICENSE)。
+本專案的程式碼（`lib/`、`scripts/`、`test/`、文件）是 MIT，見 [LICENSE](LICENSE)。
+
+`vendor/um_opencode_setup.py` **不是**本專案所寫：它是 UM 校內發放的工具，著作權屬原發放單位（澳門大學）。放在這裡只是為了讓外掛在乾淨的機器上能直接運作；若原發放單位要求移除，刪掉 `vendor/` 目錄即可，外掛會退回「家目錄必須自備腳本」的行為並給出對應的錯誤訊息。詳見 [`vendor/README.md`](vendor/README.md)。
 
 
