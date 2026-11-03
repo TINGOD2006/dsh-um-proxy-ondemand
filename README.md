@@ -90,7 +90,7 @@ curl.exe http://127.0.0.1:<GUI埠>/um-proxy-ondemand/api/status
 > 用 `curl.exe` 而不是 `curl`：Windows PowerShell 5.1 把 `curl` 別名成 `Invoke-WebRequest`，
 > 參數與輸出都不是 curl 的樣子。
 
-設定頁的「狀態」區塊看得到同樣的資訊：`running`、`pid`、`alwaysOn`、`idleTimerArmed`、請求數與喚醒數。`/api/status` 另外回報 `host.script: { path, exists }`——`exists: false` 就是代理腳本還沒裝到那個路徑，設定頁會同時顯示紅字警告。實際用法是回 DSH 選一個 `um-genai` 的模型送一句話——第一次會冷啟動（幾秒），之後走熱路徑。
+設定頁的「狀態」區塊看得到同樣的資訊：`running`、`pid`、`alwaysOn`、`idleTimerArmed`、請求數與喚醒數。`/api/status` 另外回報 `host.script: { path, exists }`——`path` 是**實際會跑的那一份**（家目錄或 `vendor/`），所以正常安裝下 `exists` 是 `true`；`false` 代表兩邊都找不到腳本，設定頁會同時顯示紅字警告。實際用法是回 DSH 選一個 `um-genai` 的模型送一句話——第一次會冷啟動（幾秒），之後走熱路徑。
 
 ### 常見錯誤
 
