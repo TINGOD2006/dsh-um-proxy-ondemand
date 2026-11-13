@@ -4,6 +4,9 @@ import { setImmediate as tick } from 'node:timers/promises'
 import * as realProxy from '../lib/proxy.js'
 
 let healthImpl, ensureImpl, stopImpl, stateImpl
+// 警告會落地到 ~/.um-opencode/plugin.log；測試不能污染真的那份。
+const logged = []
+mock.module('../lib/plugin-log.js', { exports: { pluginLog: (...args) => logged.push(args) } })
 mock.module('../lib/proxy.js', { exports: {
   ...realProxy,
   health: (...args) => healthImpl(...args),
@@ -107,4 +110,20 @@ test('explicit provider overrides default matching and invalid idle settings fai
   assert.equal(plugin.stream(() => sentinel), sentinel)
   await plugin.dispose()
   for (const config of [{ idleSeconds: 'bad' }, { idleMinutes: Infinity }, { idleMinutes: 999999, idleSeconds: null }]) assert.throws(() => setup(config))
+})
+
+test('a warning is also written to the plugin log, not just the console', async t => {
+  reset()
+  logged.length = 0
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const plugin = setup()
+  for await (const value of plugin.stream(() => (async function* () { yield 1 })())) {}
+  stopImpl = async () => ({ ok: false, stopped: false, reason: 'process-still-running' })
+  t.mock.timers.tick(1000)
+  await tick()
+  assert.equal(logged.length, 1)
+  assert.equal(logged[0][1], 'warn')
+  assert.match(logged[0][2], /idle stop incomplete/)
+  stopImpl = async () => ({ ok: true, stopped: true })
+  await plugin.dispose()
 })

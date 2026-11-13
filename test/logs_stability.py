@@ -21,6 +21,7 @@ class LogCase(unittest.TestCase):
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix="um-logs-")))
         self.watchdog = self.root / "renew-watchdog.log"
         self.models = self.root / "um-models-sync.log"
+        self.plugin = self.root / "plugin.log"
         self.proxy = self.root / "proxy.log"
         self.success = self.root / "renew-watchdog.last-success"
         self.health = self.root / "log-health.json"
@@ -34,6 +35,7 @@ class LogCase(unittest.TestCase):
             "LOGS": (
                 ("renew-watchdog.log", self.watchdog, True, "續期看門狗"),
                 ("um-models-sync.log", self.models, True, "模型同步"),
+                ("plugin.log", self.plugin, True, "插件"),
                 ("proxy.log", self.proxy, False, "代理存取"),
             ),
         }.items():
@@ -80,6 +82,13 @@ class Rotation(LogCase):
         self.assertTrue(by_name["renew-watchdog.log"]["rotated"])
         self.assertFalse(by_name["um-models-sync.log"]["rotated"])
         self.assertEqual(by_name["um-models-sync.log"]["reason"], "missing")
+
+    def test_plugin_log_is_rotated_with_the_others(self):
+        # The host appends plugin warnings; the watchdog owns the rotation.
+        self.plugin.write_text("w" * 2048, encoding="utf-8")
+        by_name = {item["name"]: item for item in logs.rotate_all()}
+        self.assertTrue(by_name["plugin.log"]["rotated"])
+        self.assertTrue((self.root / "plugin.log.1").exists())
 
 
 class Snapshot(LogCase):
@@ -159,6 +168,24 @@ class Health(LogCase):
         )
         self.assertEqual(problems[0]["code"], "rotation-failed")
         self.assertIn("WinError 32", problems[0]["detail"])
+
+    def test_one_failed_cycle_counts_once(self):
+        # A real failed cycle writes two "auto-login failed with exit code 1"
+        # (hidden, then the visible fallback), one terminal "did not produce",
+        # and three "retrying in N min" lines while it backs off. Counting any
+        # of the repeats would turn one failure into four and trip the alarm.
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 60))
+        lines = [
+            f"[{stamp}] auto-login failed with exit code 1",
+            f"[{stamp}] auto-login failed with exit code 1",
+            f"[{stamp}] auto-login did not produce a usable token; backing off before the next attempt",
+            f"[{stamp}] token is due (valid until x) but the last attempt failed; retrying in 10 min",
+            f"[{stamp}] token is due (valid until x) but the last attempt failed; retrying in 5 min",
+            f"[{stamp}] token is due (valid until x) but the last attempt failed; retrying in 0 min",
+        ]
+        self.watchdog.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.assertEqual(logs.renewal_health(time.time())["failures24h"], 1)
+        self.assertNotIn("renewal-failures", self.codes())
 
 
 class WatchdogIntegration(unittest.TestCase):

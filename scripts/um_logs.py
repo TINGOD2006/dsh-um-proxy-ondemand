@@ -48,16 +48,21 @@ LAST_SUCCESS_FILE = HOME / "renew-watchdog.last-success"
 LOGS = (
     ("renew-watchdog.log", LOG_FILE, True, "續期看門狗"),
     ("um-models-sync.log", HOME / "um-models-sync.log", True, "模型同步"),
+    ("plugin.log", HOME / "plugin.log", True, "插件"),
     ("proxy.log", HOME / "proxy.log", False, "代理存取"),
 )
 
 # What a failed renewal looks like in renew-watchdog.log. Keep these in step
 # with the log() calls in scripts/um-renew.py.
+#
+# Only the *terminal* line of a failed cycle counts. "auto-login failed with
+# exit code N" fires once per attempt (hidden, then the visible fallback) and
+# "retrying in N min" fires once per backoff cycle, so counting either would
+# turn a single failure into four and trip the three-failure alarm on its own.
 FAILURE_MARKERS = (
     "did not produce a usable token",
-    "gateway rejected the token",
     "lock is unavailable",
-    "retrying in",
+    "auto-login could not run",
 )
 FAILURE_WINDOW_SECONDS = 24 * 60 * 60
 FAILURE_LIMIT = 3
@@ -86,18 +91,27 @@ def rotate(path: pathlib.Path, max_bytes: int | None = None, backups: int | None
         return {"rotated": False, "reason": "missing", "bytes": 0}
     if size <= max_bytes:
         return {"rotated": False, "reason": "under-limit", "bytes": size}
-    try:
-        oldest = backup_path(path, backups)
-        if oldest.exists():
-            oldest.unlink()
-        for index in range(backups - 1, 0, -1):
-            source = backup_path(path, index)
-            if source.exists():
-                os.replace(source, backup_path(path, index + 1))
-        os.replace(path, backup_path(path, 1))
-    except OSError as exc:
-        return {"rotated": False, "reason": f"error: {exc}", "bytes": size}
-    return {"rotated": True, "reason": "over-limit", "bytes": size}
+    for attempt in range(2):
+        try:
+            oldest = backup_path(path, backups)
+            if oldest.exists():
+                oldest.unlink()
+            for index in range(backups - 1, 0, -1):
+                source = backup_path(path, index)
+                if source.exists():
+                    os.replace(source, backup_path(path, index + 1))
+            os.replace(path, backup_path(path, 1))
+        except OSError as exc:
+            # Windows reports a sharing violation as PermissionError while the
+            # writer still has the file open. plugin.log is written by the host
+            # process, so one short retry covers that gap instead of reporting a
+            # rotation failure that is really just a race.
+            if attempt == 0:
+                time.sleep(0.05)
+                continue
+            return {"rotated": False, "reason": f"error: {exc}", "bytes": size}
+        return {"rotated": True, "reason": "over-limit", "bytes": size}
+    return {"rotated": False, "reason": "error: unreachable", "bytes": size}
 
 
 def count_lines(path: pathlib.Path) -> int:

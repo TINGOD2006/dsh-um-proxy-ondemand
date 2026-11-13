@@ -757,7 +757,10 @@ def watchdog_cycle(args) -> int:
 
     wait = 0.0 if args.force else in_backoff(now)
     if wait > 0:
-        log(f"token is due ({state}) but the last attempt failed; retrying in {int(wait // 60)} min")
+        # int(wait // 60) printed "retrying in 0 min" for the last backoff cycle,
+        # which reads like a retry that never came. Say seconds under a minute.
+        delay = f"{int(wait // 60)} min" if wait >= 60 else f"{max(1, int(wait))}s"
+        log(f"token is due ({state}) but the last attempt failed; retrying in {delay}")
         return 1
 
     if probe_state == "unknown":

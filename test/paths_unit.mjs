@@ -14,6 +14,7 @@ import path from 'node:path'
 import assert from 'node:assert/strict'
 
 import { bundledScriptPath, DEFAULT_PORT, defaultsOf, detectPython, detectPythonCli, homeDir, logPath, resolveScript, scriptPath, statePath } from '../lib/paths.js'
+import { pluginLog, pluginLogPath } from '../lib/plugin-log.js'
 
 let failures = 0
 const check = (label, fn) => {
@@ -133,6 +134,20 @@ check('lib/paths.js 的原始碼沒有寫死作者機器的路徑', () => {
   for (const forbidden of ['TINGOD', 'Python314', 'C:\\Users\\']) {
     assert.ok(!source.includes(forbidden), `lib/paths.js 不該出現 ${forbidden}`)
   }
+})
+
+check('pluginLog：寫進 <home>/plugin.log，時間戳用本地時間（跟看門狗日誌對得上）', () => {
+  const home = path.join(fakeHome, 'plugin-log-home')
+  pluginLog(home, 'warn', 'wake failed: boom')
+  const body = fs.readFileSync(pluginLogPath(home), 'utf8')
+  const match = /^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\] warn wake failed: boom\n$/.exec(body)
+  assert.ok(match, `格式不符：${JSON.stringify(body)}`)
+  const now = new Date()
+  assert.equal(Number(match[1]), now.getFullYear())
+  assert.equal(Number(match[2]), now.getMonth() + 1)
+  assert.equal(Number(match[3]), now.getDate())
+  // 沒有 home 時必須是 no-op，不能拋。
+  pluginLog('', 'warn', 'ignored')
 })
 
 fs.rmSync(fakeHome, { recursive: true, force: true })

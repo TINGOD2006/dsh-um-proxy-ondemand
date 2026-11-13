@@ -214,6 +214,7 @@ health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死�
 | `lib/proxy.js` | 代理生命週期：`healthDetail` / `health` / `ensureProxy`（single-flight） / `stopProxy` / `listeningPids`、狀態檔節流。不依賴 cordis。 |
 | `lib/process.js` | 找 listener／找代理行程／安全終止：只殺認得出是自己那支腳本的行程。 |
 | `lib/index.js` | 事件接線（`llm/stream`）、閒置計時器、唯讀狀態端點、啟動清理與關閉清理。 |
+| `lib/plugin-log.js` | 把外掛的 `warn()` 落地到 `~/.um-opencode/plugin.log`（本地時間戳），任何寫入失敗都吞掉——記錄不能影響請求。 |
 | `lib/settings-api.js` | 設定頁的後端：`/um-proxy-ondemand/api` 底下的 `/status`、`/settings`、`/account`、`/api-key`、`/provider`，含憑證寫入（走 stdin，不經過命令列）、金鑰儲存，以及寫入 `um-genai` provider 後跑模型同步。 |
 | `lib/client.js` | 設定頁的前端 bundle（手寫的模組載入器格式，只依賴 `react`，沒有建置步驟）。 |
 | `test/ondemand_check.mjs` | 生命週期：冷啟動、沿用、停止、冪等、重複監聽。 |
@@ -227,6 +228,7 @@ health 快取（例如 2 秒內跳過）能再省 0.3ms，但代理若剛好死�
 | `scripts/um-recover.ps1` | 反代自救腳本：診斷 401（上游 UM token 過期 vs `local-api-key` 不對），可 `-Fix` 自動重新登入。 |
 | `scripts/um-renew.py` | 續期看門狗（獨立於代理）：每 5 分鐘檢查 JWT `exp`、**距上次成功續期的時間**和 gateway 是否真的接受 token，需要時自動跑 `login`、清掉殘留的登入 Chrome、先把登入瀏覽器放到隱藏桌面，並在續期後實測新 token。 |
 | `scripts/um_hidden_window.py` | 把登入用的 Chrome 開在私有的 Win32 桌面上（使用者看不到，但渲染與 DevTools 照常），並把它的 debug 埠發佈到 `browser-debug-port`；可 `--status`／`--ensure`／`--close`／`--probe`。 |
+| `scripts/um_logs.py` | 日誌輪替與健康判斷的唯一擁有者：8 MB 輪替、保留三份、數 24 小時內的續期失敗、寫 `log-health.json`；可 `--json`／`--clean`／`--check`。 |
 
 執行測試（前三支會實際啟停 8788 代理）：
 
@@ -639,10 +641,16 @@ curl.exe -s -H "Authorization: Bearer $key" "http://127.0.0.1:8788/diagnostics?p
 | --- | --- | --- |
 | `renew-watchdog.log` | `scripts/um-renew.py` | ✅ 8 MB，保留 `.1`／`.2`／`.3` |
 | `um-models-sync.log` | `scripts/um-models-sync.py` | ✅ 同上 |
+| `plugin.log` | `lib/plugin-log.js`（外掛的 `warn()`） | ✅ 同上 |
 | `proxy.log` | `um_opencode_setup.py serve` | ❌ 由代理自己在啟動時輪替 |
 
 `proxy.log` 刻意不交給看門狗：代理開著的時候檔案被佔用，Windows 上 `os.replace` 會失敗，
 而代理本來就會在 `serve` 啟動時把它改名成 `proxy.log.1`。與其兩邊搶同一個檔，不如各管各的。
+
+`plugin.log` 是後來補的：宿主的 `ctx.logger` 只寫 console，DSH 關掉之後「喚醒失敗」「關機清理失敗」
+這種一次性事件就查不到了。現在 `warn()` 除了寫 console，也追加一行到 `~/.um-opencode/plugin.log`
+（本地時間，格式跟看門狗日誌一致，方便對時），由同一個看門狗輪替。`info()` 刻意不落地——
+例行訊息會把檔案灌爆，而真正需要事後追查的是警告。
 
 ### 什麼時候跑
 
@@ -664,6 +672,16 @@ python -B scripts\um_logs.py --check     # 有問題才 exit 1，適合塞進其
 刻意不做的事：不改日誌格式、不架集中式日誌伺服器、不動 `proxy.log` 自己的輪替。
 `renew-watchdog.log` 的格式是 `[2026-11-13 19:42:12] 訊息`，`um_logs.py` 只讀尾巴 2 MB 來數失敗次數，
 不會把整個檔讀進記憶體。
+
+### 一次失敗只算一次（2026-11-13）
+
+第一版把 `auto-login failed with exit code 1`、`did not produce a usable token`、`retrying in N min`
+都當成失敗標記。但一次失敗的週期會依序寫出：隱藏桌面失敗、可見視窗重試失敗（兩行 `auto-login failed`）、
+一行 `did not produce a usable token`、三行 `retrying in …`——**一次失敗被數成 4 次**，
+單獨一次就觸發「24 小時內 ≥ 3 次」的告警。這種誤報比沒有告警更糟：它會訓練人忽略告警。
+
+現在只認「一個週期的最後一句」：`did not produce a usable token`、`lock is unavailable`、
+`auto-login could not run`。逐次嘗試與退避倒數都不算，因為它們是同一件事的過程，不是新事件。
 
 ### 設定頁的「日誌」卡
 
