@@ -69,6 +69,12 @@ FAILURE_LIMIT = 3
 # The watchdog renews every 25 minutes, so a healthy last-success is younger
 # than that; 30 minutes leaves one cycle of slack before it is worth a warning.
 STALE_SUCCESS_SECONDS = 30 * 60
+# A snapshot older than three watchdog cycles means the checker itself stopped.
+# This is the one problem snapshot() cannot report about itself: it only writes
+# while it runs, so a dead watchdog leaves a frozen file that still says
+# "no problems". The judgement therefore belongs to the reader (settings page,
+# um-health.py), which is what snapshot_age() is for.
+SNAPSHOT_STALE_SECONDS = 15 * 60
 TAIL_BYTES = 2 * 1024 * 1024
 STAMP = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 
@@ -254,12 +260,34 @@ def snapshot(proxy_log: pathlib.Path | None = None, rotations: list[dict] | None
         files.append(item)
     return {
         "checkedAt": int(now),
+        "staleAfterSeconds": SNAPSHOT_STALE_SECONDS,
         "maxBytes": MAX_BYTES,
         "backups": BACKUPS,
         "files": files,
         "renewal": renewal_health(now),
         "problems": check(now, rotations),
     }
+
+
+def snapshot_age(health: dict | None, now: float | None = None) -> dict:
+    """Judge how old a stored snapshot is.
+
+    Returns ``{"ageSeconds": int | None, "stale": bool}``. A snapshot without a
+    usable ``checkedAt`` counts as stale: freshness cannot be proven, and
+    assuming it is fresh is exactly the failure this guards against.
+    """
+    now = time.time() if now is None else now
+    health = health or {}
+    try:
+        checked = float(health.get("checkedAt"))
+    except (TypeError, ValueError):
+        return {"ageSeconds": None, "stale": True}
+    age = max(0, int(now - checked))
+    try:
+        limit = float(health.get("staleAfterSeconds"))
+    except (TypeError, ValueError):
+        limit = float(SNAPSHOT_STALE_SECONDS)
+    return {"ageSeconds": age, "stale": age > limit}
 
 
 def write_atomic(path: pathlib.Path, text: str) -> bool:

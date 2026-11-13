@@ -118,6 +118,43 @@ class Snapshot(LogCase):
         self.assertEqual(saved["checkedAt"], data["checkedAt"])
         self.assertTrue(self.backup(1).exists())
 
+    def test_snapshot_carries_its_own_staleness_limit(self):
+        # 讀取端（設定頁、um-health）不該各自寫死 15 分鐘。
+        data = logs.snapshot(now=1000.0)
+        self.assertEqual(data["checkedAt"], 1000)
+        self.assertEqual(data["staleAfterSeconds"], logs.SNAPSHOT_STALE_SECONDS)
+
+
+class SnapshotAge(unittest.TestCase):
+    """凍住的快照看起來永遠是「沒有問題」，所以新鮮度只能由讀取端判斷。"""
+
+    def test_a_fresh_snapshot_is_not_stale(self):
+        now = 10_000.0
+        result = logs.snapshot_age({"checkedAt": int(now) - 60, "staleAfterSeconds": 900}, now=now)
+        self.assertEqual(result["ageSeconds"], 60)
+        self.assertFalse(result["stale"])
+
+    def test_three_missed_cycles_are_stale(self):
+        now = 10_000.0
+        result = logs.snapshot_age({"checkedAt": int(now) - 901, "staleAfterSeconds": 900}, now=now)
+        self.assertTrue(result["stale"])
+
+    def test_a_snapshot_without_a_timestamp_counts_as_stale(self):
+        self.assertTrue(logs.snapshot_age({}, now=10_000.0)["stale"])
+        self.assertIsNone(logs.snapshot_age({}, now=10_000.0)["ageSeconds"])
+        self.assertTrue(logs.snapshot_age(None, now=10_000.0)["stale"])
+
+    def test_a_missing_limit_falls_back_to_the_module_default(self):
+        now = 10_000.0
+        result = logs.snapshot_age({"checkedAt": int(now) - logs.SNAPSHOT_STALE_SECONDS - 1}, now=now)
+        self.assertTrue(result["stale"])
+
+    def test_a_clock_that_went_backwards_is_not_stale(self):
+        now = 10_000.0
+        result = logs.snapshot_age({"checkedAt": int(now) + 600, "staleAfterSeconds": 900}, now=now)
+        self.assertEqual(result["ageSeconds"], 0)
+        self.assertFalse(result["stale"])
+
 
 class Health(LogCase):
     def write_failures(self, count, age_seconds=60):

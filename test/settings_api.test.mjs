@@ -679,6 +679,44 @@ test('GET /logs：讀得到看門狗留下的快照', async () => {
   assert.equal(res.body.files[0].bytes, 2048)
 })
 
+test('GET /logs：快照新鮮時不算過期', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'um-logs-'))
+  const now = Math.floor(Date.now() / 1000)
+  fs.writeFileSync(
+    path.join(home, 'log-health.json'),
+    JSON.stringify({ checkedAt: now - 60, staleAfterSeconds: 900, files: [], renewal: {}, problems: [] }),
+  )
+  const { route } = mount({}, { ...baseOptions, home })
+  const res = await call(route, 'GET', '/logs')
+
+  assert.equal(res.body.stale, false)
+  assert.ok(res.body.ageSeconds >= 60 && res.body.ageSeconds < 180, `ageSeconds=${res.body.ageSeconds}`)
+})
+
+test('GET /logs：看門狗停擺時快照被標成過期', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'um-logs-'))
+  const now = Math.floor(Date.now() / 1000)
+  fs.writeFileSync(
+    path.join(home, 'log-health.json'),
+    JSON.stringify({ checkedAt: now - 3600, staleAfterSeconds: 900, files: [], renewal: {}, problems: [] }),
+  )
+  const { route } = mount({}, { ...baseOptions, home })
+  const res = await call(route, 'GET', '/logs')
+
+  assert.equal(res.body.stale, true)
+  assert.ok(res.body.ageSeconds >= 3600)
+})
+
+test('GET /logs：沒有 checkedAt 的快照一律當成過期', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'um-logs-'))
+  fs.writeFileSync(path.join(home, 'log-health.json'), JSON.stringify({ files: [], renewal: {}, problems: [] }))
+  const { route } = mount({}, { ...baseOptions, home })
+  const res = await call(route, 'GET', '/logs')
+
+  assert.equal(res.body.stale, true)
+  assert.equal(res.body.ageSeconds, null)
+})
+
 test('GET /logs：壞掉的 JSON 當成沒有快照', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'um-logs-'))
   fs.writeFileSync(path.join(home, 'log-health.json'), '{not json')

@@ -608,7 +608,8 @@ npm run um:health -- --no-tasks   # 跳過排程查詢（沒有 schtasks 權限�
 檢查項目：`/health`、帶 key 的 `/v1/models`、`/diagnostics`（代理自己的計數器與 log 統計）、
 上游 token 剩餘時間（`/diagnostics` 不可用時直接解 JWT `exp`）、**`gateway accepts token`（直接拿 token 打
 `https://chat.genai.um.edu.mo/api/models`，401 就判 FAIL 並提示跑 `um-renew.py --force`）**、
-`renew-watchdog.log` 最後一行、排程 `\UMGenAIProxy-Renew` 與 `\UMGenAIProxy-Models` 的狀態與下次執行時間。
+`renew-watchdog.log` 最後一行、`log health`（看門狗留下的日誌快照：輪替狀態、24 小時失敗數、快照新不新）、
+排程 `\UMGenAIProxy-Renew` 與 `\UMGenAIProxy-Models` 的狀態與下次執行時間。
 
 > 為什麼要單獨一列：JWT 的 `exp` 只是本地宣稱。2026-10-25 就出現過「JWT 顯示還有 4.7 小時、gateway 已經 401」
 > 的情況，只看剩餘時間的健康檢查會給出綠色。詳細事故說明見上面「JWT `exp` 不是有效性證明」。
@@ -672,6 +673,21 @@ python -B scripts\um_logs.py --check     # 有問題才 exit 1，適合塞進其
 刻意不做的事：不改日誌格式、不架集中式日誌伺服器、不動 `proxy.log` 自己的輪替。
 `renew-watchdog.log` 的格式是 `[2026-11-13 19:42:12] 訊息`，`um_logs.py` 只讀尾巴 2 MB 來數失敗次數，
 不會把整個檔讀進記憶體。
+
+### 快照凍住 = 檢查器自己停擺
+
+上面三條規則都由 `snapshot()` 在**跑的時候**判斷，所以它們有一個共同的盲點：看門狗不跑的時候，
+`log-health.json` 就凍在最後一次寫入的狀態，而那份凍住的快照仍然寫著「沒有問題」。
+檢查器死掉本身不會產生任何告警——這正是最需要被發現的情況。
+
+所以新鮮度由**讀取端**判斷，不是由寫入端宣告：
+
+- `snapshot()` 把 `checkedAt` 和 `staleAfterSeconds`（15 分鐘＝三個看門狗週期）一起寫進快照；
+- 設定頁的 `/logs` 算出 `ageSeconds` 與 `stale`，卡片顯示「快照時間」，過期時紅字寫
+  「快照已 N 分鐘未更新（看門狗每 5 分鐘跑一次），續期檢查可能停擺了」；
+- `um-health.py` 的 `log health` 一列同樣判年齡，過期就 WARN。
+
+沒有 `checkedAt` 的快照一律當成過期：無法證明新鮮，就當成不新鮮。
 
 ### 一次失敗只算一次（2026-11-13）
 

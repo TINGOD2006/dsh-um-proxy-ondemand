@@ -143,6 +143,68 @@ class Stability(unittest.TestCase):
                 health.check_tasks(checks)
             self.assertEqual(checks.worst(), health.WARN)
 
+    def test_fresh_log_snapshot_is_ok(self):
+        with tempfile.TemporaryDirectory(prefix="dsh-log-health-") as directory:
+            install = Path(directory)
+            (install / "log-health.json").write_text(
+                json.dumps(
+                    {
+                        "checkedAt": int(time.time()) - 60,
+                        "staleAfterSeconds": 900,
+                        "files": [{"name": "renew-watchdog.log"}],
+                        "renewal": {"failures24h": 0},
+                        "problems": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            checks = health.Checks()
+            health.check_logs(checks, install)
+            self.assertEqual(checks.worst(), health.OK)
+            self.assertIn("1 files", checks.rows[0]["detail"])
+
+    def test_a_frozen_snapshot_is_a_warning(self):
+        # 看門狗停擺時檔案仍寫著「沒有問題」，只有年齡看得出來。
+        with tempfile.TemporaryDirectory(prefix="dsh-log-health-") as directory:
+            install = Path(directory)
+            (install / "log-health.json").write_text(
+                json.dumps({"checkedAt": int(time.time()) - 3600, "staleAfterSeconds": 900, "problems": []}),
+                encoding="utf-8",
+            )
+            checks = health.Checks()
+            health.check_logs(checks, install)
+            self.assertEqual(checks.worst(), health.WARN)
+            self.assertIn("may have stopped", checks.rows[0]["detail"])
+
+    def test_missing_or_broken_snapshot_is_a_warning(self):
+        with tempfile.TemporaryDirectory(prefix="dsh-log-health-") as directory:
+            install = Path(directory)
+            checks = health.Checks()
+            health.check_logs(checks, install)
+            self.assertEqual(checks.worst(), health.WARN)
+            (install / "log-health.json").write_text("{not json", encoding="utf-8")
+            checks = health.Checks()
+            health.check_logs(checks, install)
+            self.assertEqual(checks.worst(), health.WARN)
+
+    def test_reported_problems_surface_in_the_health_row(self):
+        with tempfile.TemporaryDirectory(prefix="dsh-log-health-") as directory:
+            install = Path(directory)
+            (install / "log-health.json").write_text(
+                json.dumps(
+                    {
+                        "checkedAt": int(time.time()),
+                        "staleAfterSeconds": 900,
+                        "problems": [{"code": "rotation-failed", "detail": "renew-watchdog.log: PermissionError"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            checks = health.Checks()
+            health.check_logs(checks, install)
+            self.assertEqual(checks.worst(), health.WARN)
+            self.assertIn("PermissionError", checks.rows[0]["detail"])
+
     def test_sync_rolls_back_first_file_when_second_write_fails(self):
         with tempfile.TemporaryDirectory(prefix="dsh-model-sync-") as directory:
             files = [Path(directory) / name for name in ("first.json", "second.json")]

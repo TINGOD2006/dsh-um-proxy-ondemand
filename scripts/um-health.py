@@ -8,7 +8,8 @@ Checks, in order:
   4. token file         - when /diagnostics is unavailable (old proxy build)
   5. gateway            - the UM gateway still accepts the stored token
   6. renew watchdog log - the last automatic token renewal
-  7. scheduled tasks    - \\UMGenAIProxy-Renew and \\UMGenAIProxy-Models exist
+  7. log health         - the watchdog's own snapshot: rotation, failures, freshness
+  8. scheduled tasks    - \\UMGenAIProxy-Renew and \\UMGenAIProxy-Models exist
 
 The proxy/build row matters: an edited um_opencode_setup.py only takes effect
 after the proxy restarts, so a stale process can keep serving old code while
@@ -40,6 +41,10 @@ import urllib.request
 HOME = pathlib.Path.home()
 DEFAULT_INSTALL = HOME / ".um-opencode"
 WATCHDOG_LOG = DEFAULT_INSTALL / "renew-watchdog.log"
+LOG_HEALTH = "log-health.json"
+# Three watchdog cycles. Mirrors SNAPSHOT_STALE_SECONDS in um_logs.py; the
+# snapshot carries its own value, so this is only the fallback for old files.
+SNAPSHOT_STALE_SECONDS = 15 * 60
 TASKS = (r"\UMGenAIProxy-Renew", r"\UMGenAIProxy-Models")
 UPSTREAM_BASE = "https://chat.genai.um.edu.mo"
 
@@ -305,6 +310,47 @@ def check_watchdog(checks: Checks, log_path: pathlib.Path) -> None:
         checks.add(OK, "renew watchdog", last[:160])
 
 
+def check_logs(checks: Checks, install_dir: pathlib.Path) -> None:
+    """The watchdog's own snapshot: rotation state, failures, and freshness.
+
+    Freshness is the point of this row. A dead watchdog leaves the snapshot
+    frozen, and a frozen snapshot still says "no problems" — so the age has to
+    be judged here, not trusted from the file.
+    """
+    path = install_dir / LOG_HEALTH
+    try:
+        health = json.loads(path.read_text(encoding="utf-8"))
+    except OSError:
+        checks.add(WARN, "log health", f"{path} is missing (the watchdog has not run yet)")
+        return
+    except (ValueError, UnicodeDecodeError):
+        checks.add(WARN, "log health", f"{path} is not valid JSON")
+        return
+    if not isinstance(health, dict):
+        checks.add(WARN, "log health", f"{path} is not a JSON object")
+        return
+    problems = health.get("problems") or []
+    try:
+        age = max(0, int(time.time() - float(health.get("checkedAt"))))
+    except (TypeError, ValueError):
+        age = None
+    try:
+        limit = float(health.get("staleAfterSeconds"))
+    except (TypeError, ValueError):
+        limit = float(SNAPSHOT_STALE_SECONDS)
+    failures = (health.get("renewal") or {}).get("failures24h") or 0
+    detail = f"{len(health.get('files') or [])} files, {failures} renewal failure(s) in 24h"
+    if age is None:
+        checks.add(WARN, "log health", f"snapshot has no usable checkedAt ({detail})")
+    elif age > limit:
+        checks.add(WARN, "log health", f"snapshot is {age // 60} min old; the watchdog may have stopped ({detail})")
+    elif problems:
+        text = "; ".join(str(item.get("detail") or item.get("code")) for item in problems if isinstance(item, dict))
+        checks.add(WARN, "log health", text[:200] or detail)
+    else:
+        checks.add(OK, "log health", detail)
+
+
 def check_tasks(checks: Checks) -> None:
     for task in TASKS:
         try:
@@ -363,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
         run_check(checks, "upstream-token file", check_token_file, args.install_dir)
     run_check(checks, "gateway accepts token", check_gateway, args.install_dir)
     run_check(checks, "renew watchdog", check_watchdog, args.install_dir / "renew-watchdog.log")
+    run_check(checks, "log health", check_logs, args.install_dir)
     if not args.no_tasks:
         run_check(checks, "scheduled tasks", check_tasks)
 
