@@ -646,3 +646,78 @@ test('modelsSyncOutcome：10 / 5 / 4 都算失敗，並帶上腳本輸出', () =
     },
   )
 })
+
+// ── 日誌 ──────────────────────────────────────────────────────────────────
+
+test('GET /logs：沒有快照時回 available:false，而不是 500', async () => {
+  const { route } = mount({}, baseOptions)
+  const res = await call(route, 'GET', '/logs')
+
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+  assert.equal(res.body.available, false)
+  assert.match(res.body.file, /log-health\.json$/)
+})
+
+test('GET /logs：讀得到看門狗留下的快照', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'um-logs-'))
+  const snapshot = {
+    checkedAt: 1794570955,
+    maxBytes: 8 * 1024 * 1024,
+    backups: 3,
+    files: [{ name: 'renew-watchdog.log', exists: true, bytes: 2048, backups: 1 }],
+    renewal: { failures24h: 0, lastSuccessAt: 1794570000 },
+    problems: [],
+  }
+  fs.writeFileSync(path.join(home, 'log-health.json'), JSON.stringify(snapshot))
+  const { route } = mount({}, { ...baseOptions, home })
+  const res = await call(route, 'GET', '/logs')
+
+  assert.equal(res.status, 200)
+  assert.equal(res.body.available, true)
+  assert.equal(res.body.renewal.failures24h, 0)
+  assert.equal(res.body.files[0].bytes, 2048)
+})
+
+test('GET /logs：壞掉的 JSON 當成沒有快照', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'um-logs-'))
+  fs.writeFileSync(path.join(home, 'log-health.json'), '{not json')
+  const { route } = mount({}, { ...baseOptions, home })
+  const res = await call(route, 'GET', '/logs')
+
+  assert.equal(res.status, 200)
+  assert.equal(res.body.available, false)
+})
+
+test('POST /logs/rotate：把清理結果原樣回給設定頁', async () => {
+  const calls = []
+  const { route } = mount({}, {
+    ...baseOptions,
+    cleanLogs: async (cfg, home) => {
+      calls.push({ cfg, home })
+      return { checkedAt: 1, files: [], problems: [] }
+    },
+  })
+  const res = await call(route, 'POST', '/logs/rotate', {})
+
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+  assert.equal(res.body.checkedAt, 1)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].home, baseOptions.home)
+})
+
+test('POST /logs/rotate：清理失敗時把狀態碼與原因傳出去', async () => {
+  const { route } = mount({}, {
+    ...baseOptions,
+    cleanLogs: async () => {
+      const err = new Error('找不到日誌清理腳本')
+      err.status = 500
+      throw err
+    },
+  })
+  const res = await call(route, 'POST', '/logs/rotate', {})
+
+  assert.equal(res.status, 500)
+  assert.match(res.body.error, /找不到/)
+})

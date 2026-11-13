@@ -24,6 +24,7 @@ def load(name):
 
 
 renew, health, models = load("um-renew"), load("um-health"), load("um-models-sync")
+logs = load("um_logs")
 
 
 def jwt(payload):

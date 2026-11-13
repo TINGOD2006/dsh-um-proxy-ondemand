@@ -78,6 +78,10 @@ try:  # the module ships next to this script; a missing copy only loses the hidi
     import um_hidden_window
 except ImportError:  # pragma: no cover
     um_hidden_window = None
+try:  # log hygiene is a convenience; a missing copy must not stop a renewal
+    import um_logs
+except ImportError:  # pragma: no cover
+    um_logs = None
 
 UPSTREAM_BASE = os.environ.get("UM_UPSTREAM_BASE", "https://chat.genai.um.edu.mo")
 PROBE_PATH = "/api/models"
@@ -116,6 +120,21 @@ def log(message: str) -> None:
             handle.write(line)
     except OSError:
         pass
+
+
+def tidy_logs() -> None:
+    """Rotate the logs this toolchain owns and refresh the health snapshot.
+
+    Runs at the top of every cycle, so the cleanup needs no schedule of its own
+    and the settings page always has a snapshot younger than five minutes. A
+    failure here must never cost a renewal: the token matters more than the log.
+    """
+    if um_logs is None:
+        return
+    try:
+        um_logs.maintenance(proxy_log=HOME / "proxy.log")
+    except Exception as exc:  # noqa: BLE001 - log hygiene is best effort
+        log(f"log maintenance failed: {type(exc).__name__}: {exc}")
 
 
 def python_executable() -> str:
@@ -683,6 +702,11 @@ def main() -> int:
         print(f"login      : {'hidden desktop' if hidden_login_enabled() else 'visible window'} "
               "(UM_HIDDEN_LOGIN)")
         print(f"log file   : {LOG_FILE}")
+        if um_logs is not None:
+            health = um_logs.renewal_health(now)
+            age = health["lastSuccessAgeSeconds"]
+            last = "never" if age is None else f"{age // 60} min ago"
+            print(f"log health : {health['failures24h']} failure(s) in 24h, last success {last}")
         return 0
 
     if args.probe:
@@ -701,6 +725,7 @@ def main() -> int:
 
 
 def watchdog_cycle(args) -> int:
+    tidy_logs()
     proxy_ok = ensure_proxy()
     now = time.time()
     exp = token_expiry()

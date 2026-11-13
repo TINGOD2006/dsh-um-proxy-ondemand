@@ -630,6 +630,47 @@ curl.exe -s -H "Authorization: Bearer $key" "http://127.0.0.1:8788/diagnostics?p
 **上游抖動自動重試**：連線被重置／`IncompleteRead`／`RemoteDisconnected`，以及上游回
 `502/503/504`，都會換一條新連線重試一次（連線層 0.4s、5xx 0.6s 後重試）；用完才把 502 回給客戶端。
 
+## 日誌：輪替、健康檢查與設定頁檢視
+
+以前四條日誌各寫各的檔，`renew-watchdog.log` 從 2026-10-22 起只增不減（到 11-13 已 6,472 行），
+而續期出問題時沒有任何地方看得到。現在由 `scripts/um_logs.py` 統一擁有「輪替」與「判斷」：
+
+| 檔案 | 誰寫的 | 輪替 |
+| --- | --- | --- |
+| `renew-watchdog.log` | `scripts/um-renew.py` | ✅ 8 MB，保留 `.1`／`.2`／`.3` |
+| `um-models-sync.log` | `scripts/um-models-sync.py` | ✅ 同上 |
+| `proxy.log` | `um_opencode_setup.py serve` | ❌ 由代理自己在啟動時輪替 |
+
+`proxy.log` 刻意不交給看門狗：代理開著的時候檔案被佔用，Windows 上 `os.replace` 會失敗，
+而代理本來就會在 `serve` 啟動時把它改名成 `proxy.log.1`。與其兩邊搶同一個檔，不如各管各的。
+
+### 什麼時候跑
+
+併進既有的 5 分鐘看門狗，沒有新增排程。`watchdog_cycle()` 一開頭先 `tidy_logs()`，
+輪替完把快照寫到 `~/.um-opencode/log-health.json`，設定頁只讀這個檔，不會為了顯示日誌去叫 Python。
+
+```powershell
+python -B scripts\um_logs.py --json      # 只印快照，不動檔案
+python -B scripts\um_logs.py --clean     # 輪替 + 寫快照（看門狗跑的就是這個）
+python -B scripts\um_logs.py --check     # 有問題才 exit 1，適合塞進其他腳本
+```
+
+### 判斷規則只有三條
+
+1. 24 小時內續期失敗 ≥ 3 次；
+2. 最後一次成功續期超過 30 分鐘（token 壽命約 8 小時，30 分鐘沒成功代表看門狗卡住了）；
+3. 輪替本身出錯（檔案被佔用、權限不足）。
+
+刻意不做的事：不改日誌格式、不架集中式日誌伺服器、不動 `proxy.log` 自己的輪替。
+`renew-watchdog.log` 的格式是 `[2026-11-13 19:42:12] 訊息`，`um_logs.py` 只讀尾巴 2 MB 來數失敗次數，
+不會把整個檔讀進記憶體。
+
+### 設定頁的「日誌」卡
+
+`GET /logs` 回傳快照（沒有快照時回 `available: false`，不是 500），`POST /logs/rotate` 立刻跑一次清理。
+卡片每 30 秒更新一次（狀態卡是 5 秒），列出每個檔的大小／備份數／最後修改時間、上次成功續期、
+24 小時失敗次數，有問題時逐條列出，沒問題就寫「沒有發現問題」。
+
 ## 注意事項
 
 - **要重啟 DSH host 才會生效**：外掛是 `%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-um-proxy-ondemand`
