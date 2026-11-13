@@ -52,6 +52,11 @@ LOGS = (
     ("proxy.log", HOME / "proxy.log", False, "代理存取"),
 )
 
+# Files that only appear once something happened. A missing plugin.log means
+# "no warnings yet", not "something is broken", so the settings page must not
+# paint it as a problem — a false alarm is worse than no alarm.
+OPTIONAL_LOGS = frozenset({"plugin.log"})
+
 # What a failed renewal looks like in renew-watchdog.log. Keep these in step
 # with the log() calls in scripts/um-renew.py.
 #
@@ -257,6 +262,7 @@ def snapshot(proxy_log: pathlib.Path | None = None, rotations: list[dict] | None
         item["name"] = name
         item["label"] = label
         item["rotated"] = enabled
+        item["optional"] = name in OPTIONAL_LOGS
         files.append(item)
     return {
         "checkedAt": int(now),

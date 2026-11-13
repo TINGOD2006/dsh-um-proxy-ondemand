@@ -124,6 +124,13 @@ class Snapshot(LogCase):
         self.assertEqual(data["checkedAt"], 1000)
         self.assertEqual(data["staleAfterSeconds"], logs.SNAPSHOT_STALE_SECONDS)
 
+    def test_optional_logs_are_marked_so_a_missing_file_is_not_an_alarm(self):
+        # plugin.log 不存在＝還沒發生過警告，不是壞掉。
+        files = {item["name"]: item for item in logs.snapshot()["files"]}
+        self.assertTrue(files["plugin.log"]["optional"])
+        self.assertFalse(files["plugin.log"]["exists"])
+        self.assertFalse(files["renew-watchdog.log"]["optional"])
+
 
 class SnapshotAge(unittest.TestCase):
     """凍住的快照看起來永遠是「沒有問題」，所以新鮮度只能由讀取端判斷。"""
